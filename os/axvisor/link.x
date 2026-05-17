@@ -1,0 +1,1 @@
+/home/ssdns/code/tgoskits/os/axvisor/target/x86_64-unknown-none/release/linker.x

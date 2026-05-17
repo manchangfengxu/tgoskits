@@ -21,8 +21,8 @@ use ax_errno::{AxResult, ax_err_type};
 use axvm::{
     AxVM, AxVMRef, GuestPhysAddr, VMMemoryRegion,
     config::{
-        AxVCpuConfig, AxVMConfig, AxVMConfigParams, PhysCpuList, RamdiskInfo, VMBootProtocol,
-        VMImageConfig, adjusted_kernel_load_gpa,
+        AxVCpuConfig, AxVMConfig, AxVMConfigParams, OvmfInfo, PhysCpuList, RamdiskInfo,
+        VMBootProtocol, VMImageConfig, adjusted_kernel_load_gpa,
     },
 };
 use axvmconfig::{AxVMCrateConfig, VMType, VmMemConfig, VmMemMappingType};
@@ -136,7 +136,9 @@ pub fn init_guest_vm(raw_cfg: &str) -> AxResult<usize> {
     #[cfg(all(feature = "fs", target_arch = "x86_64"))]
     let release_host_filesystem = vm_config_needs_host_filesystem_release(&vm_create_config);
 
-    if let Some(linux) = super::images::get_image_header(&vm_create_config) {
+    if vm_create_config.kernel.effective_boot_protocol() != VMBootProtocol::Uefi
+        && let Some(linux) = super::images::get_image_header(&vm_create_config)
+    {
         debug!(
             "VM[{}] Linux header: {:#x?}",
             vm_create_config.base.id, linux
@@ -219,13 +221,14 @@ pub(crate) fn build_axvm_config(cfg: &AxVMCrateConfig) -> AxVMConfig {
             cfg.base.phys_cpu_sets.clone(),
         ),
         cpu_config: AxVCpuConfig {
-            bsp_entry: GuestPhysAddr::from(cfg.kernel.entry_point),
+            bsp_entry: GuestPhysAddr::from(configured_bsp_entry(cfg)),
             ap_entry: GuestPhysAddr::from(cfg.kernel.entry_point),
         },
         image_config: VMImageConfig {
             kernel_load_gpa: GuestPhysAddr::from(cfg.kernel.kernel_load_addr),
             loaded_from_filesystem: cfg.kernel.image_location.as_deref() == Some("fs"),
             bios_load_gpa: configured_bios_load_gpa(cfg),
+            ovmf: configured_ovmf(cfg),
             dtb_load_gpa: cfg.kernel.dtb_load_addr.map(GuestPhysAddr::from),
             ramdisk: cfg.kernel.ramdisk_load_addr.map(|addr| RamdiskInfo {
                 load_gpa: GuestPhysAddr::from(addr),
@@ -238,6 +241,14 @@ pub(crate) fn build_axvm_config(cfg: &AxVMCrateConfig) -> AxVMConfig {
         pass_through_addresses: cfg.devices.passthrough_addresses.clone(),
         interrupt_mode: cfg.devices.interrupt_mode,
     })
+}
+
+fn configured_bsp_entry(cfg: &AxVMCrateConfig) -> usize {
+    if cfg.kernel.effective_boot_protocol() == VMBootProtocol::Uefi {
+        cfg.kernel.reset_vector.unwrap_or(cfg.kernel.entry_point)
+    } else {
+        cfg.kernel.entry_point
+    }
 }
 
 fn configured_bios_load_gpa(cfg: &AxVMCrateConfig) -> Option<GuestPhysAddr> {
@@ -257,6 +268,13 @@ fn configured_bios_load_gpa(cfg: &AxVMCrateConfig) -> Option<GuestPhysAddr> {
     }
 
     None
+}
+
+fn configured_ovmf(cfg: &AxVMCrateConfig) -> Option<OvmfInfo> {
+    cfg.kernel.ovmf_code_base.map(|code_base| OvmfInfo {
+        code_load_gpa: GuestPhysAddr::from(code_base),
+        vars_load_gpa: cfg.kernel.ovmf_vars_base.map(GuestPhysAddr::from),
+    })
 }
 
 #[cfg(all(feature = "fs", target_arch = "x86_64"))]

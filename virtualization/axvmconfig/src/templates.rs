@@ -71,11 +71,17 @@ pub fn get_vm_config_template(params: VmTemplateParams) -> AxVMCrateConfig {
             entry_point: params.entry_point,
             kernel_path: params.kernel_path,
             kernel_load_addr: params.kernel_load_addr,
+            boot: None,
             enable_bios: false,
             boot_protocol: None,
             bios_path: None, // BIOS not used in most configurations
             uefi_firmware_path: None,
             bios_load_addr: None,
+            ovmf_code_path: None,
+            ovmf_code_base: None,
+            ovmf_vars_path: None,
+            ovmf_vars_base: None,
+            reset_vector: None,
             dtb_path: None, // Device tree not specified by default
             dtb_load_addr: None,
             ramdisk_path: None, // No initial ramdisk by default

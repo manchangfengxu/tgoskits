@@ -97,6 +97,8 @@ pub struct ImageLoader {
     config: AxVMCrateConfig,
     kernel_load_gpa: GuestPhysAddr,
     bios_load_gpa: Option<GuestPhysAddr>,
+    ovmf_code_gpa: Option<GuestPhysAddr>,
+    ovmf_vars_gpa: Option<GuestPhysAddr>,
     dtb_load_gpa: Option<GuestPhysAddr>,
     ramdisk_load_gpa: Option<GuestPhysAddr>,
 }
@@ -109,6 +111,8 @@ impl ImageLoader {
             config,
             kernel_load_gpa: GuestPhysAddr::default(),
             bios_load_gpa: None,
+            ovmf_code_gpa: None,
+            ovmf_vars_gpa: None,
             dtb_load_gpa: None,
             ramdisk_load_gpa: None,
         }
@@ -128,6 +132,10 @@ impl ImageLoader {
             self.kernel_load_gpa = config.image_config.kernel_load_gpa;
             self.dtb_load_gpa = config.image_config.dtb_load_gpa;
             self.bios_load_gpa = config.image_config.bios_load_gpa;
+            if let Some(ovmf) = &config.image_config.ovmf {
+                self.ovmf_code_gpa = Some(ovmf.code_load_gpa);
+                self.ovmf_vars_gpa = ovmf.vars_load_gpa;
+            }
             self.ramdisk_load_gpa = config.image_config.ramdisk.as_ref().map(|r| r.load_gpa);
         });
 
@@ -253,6 +261,13 @@ impl ImageLoader {
             return Ok(());
         }
 
+        #[cfg(target_arch = "x86_64")]
+        if self.config.kernel.effective_boot_protocol() == VMBootProtocol::Uefi
+            && self.config.kernel.ovmf_code_path.is_some()
+        {
+            return self.load_uefi_ovmf_images();
+        }
+
         if let Some(buffer) = bios {
             let load_gpa = self
                 .bios_load_gpa
@@ -310,6 +325,49 @@ impl ImageLoader {
         }
 
         Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn load_uefi_ovmf_images(&self) -> AxResult {
+        #[cfg(feature = "fs")]
+        {
+            let ovmf_code_path = self
+                .config
+                .kernel
+                .ovmf_code_path
+                .as_deref()
+                .ok_or_else(|| ax_err_type!(NotFound, "UEFI boot requires ovmf_code_path"))?;
+            let ovmf_code_gpa = self
+                .ovmf_code_gpa
+                .ok_or_else(|| ax_err_type!(NotFound, "UEFI boot requires ovmf_code_base"))?;
+
+            info!(
+                "Loading OVMF_CODE image from {} into GPA {:#x}",
+                ovmf_code_path,
+                ovmf_code_gpa.as_usize()
+            );
+            fs::load_vm_image(ovmf_code_path, ovmf_code_gpa, self.vm.clone())?;
+
+            if let Some(ovmf_vars_path) = self.config.kernel.ovmf_vars_path.as_deref()
+                && let Some(ovmf_vars_gpa) = self.ovmf_vars_gpa
+            {
+                info!(
+                    "Loading OVMF_VARS image from {} into GPA {:#x}",
+                    ovmf_vars_path,
+                    ovmf_vars_gpa.as_usize()
+                );
+                fs::load_vm_image(ovmf_vars_path, ovmf_vars_gpa, self.vm.clone())?;
+            }
+
+            Ok(())
+        }
+        #[cfg(not(feature = "fs"))]
+        {
+            Err(ax_err_type!(
+                Unsupported,
+                "UEFI OVMF images require image_location = \"fs\" and the fs feature"
+            ))
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -649,6 +707,12 @@ pub mod fs {
                     }
                     Err(err) => debug!("Unable to probe x86 Linux bzImage header: {err:?}"),
                 }
+            }
+            if loader.config.kernel.effective_boot_protocol() == VMBootProtocol::Uefi
+                && loader.config.kernel.ovmf_code_path.is_some()
+            {
+                loader.load_uefi_ovmf_images()?;
+                return Ok(());
             }
         }
         // Load kernel image.

@@ -497,6 +497,9 @@ pub struct VMKernelConfig {
     pub kernel_path: String,
     /// The load address of the kernel image.
     pub kernel_load_addr: usize,
+    /// Legacy boot flow selector, for example "trampoline" or "uefi".
+    #[serde(default)]
+    pub boot: Option<String>,
     /// Whether to enable BIOS boot flow for this VM.
     #[serde(default)]
     pub enable_bios: bool,
@@ -517,6 +520,21 @@ pub struct VMKernelConfig {
     pub uefi_firmware_path: Option<String>,
     /// The load address of the BIOS image, `None` if not used.
     pub bios_load_addr: Option<usize>,
+    /// The file path of the OVMF_CODE image, `None` if not used.
+    #[serde(default)]
+    pub ovmf_code_path: Option<String>,
+    /// The load address of the OVMF_CODE image, `None` if not used.
+    #[serde(default)]
+    pub ovmf_code_base: Option<usize>,
+    /// The file path of the OVMF_VARS image, `None` if not used.
+    #[serde(default)]
+    pub ovmf_vars_path: Option<String>,
+    /// The load address of the OVMF_VARS image, `None` if not used.
+    #[serde(default)]
+    pub ovmf_vars_base: Option<usize>,
+    /// The x86 reset vector for UEFI firmware, `None` if not used.
+    #[serde(default)]
+    pub reset_vector: Option<usize>,
     /// The file path of the device tree blob (DTB), `None` if not used.
     pub dtb_path: Option<String>,
     /// The load address of the device tree blob (DTB), `None` if not used.
@@ -546,7 +564,10 @@ pub struct VMKernelConfig {
 impl VMKernelConfig {
     /// Returns the effective boot protocol after applying compatibility defaults.
     pub fn effective_boot_protocol(&self) -> VMBootProtocol {
-        self.boot_protocol.unwrap_or({
+        self.boot_protocol.unwrap_or_else(|| {
+            if self.boot.as_deref() == Some("uefi") {
+                return VMBootProtocol::Uefi;
+            }
             if self.enable_bios {
                 VMBootProtocol::Multiboot
             } else {
@@ -564,6 +585,7 @@ impl VMKernelConfig {
             VMBootProtocol::Uefi => self
                 .uefi_firmware_path
                 .as_deref()
+                .or(self.ovmf_code_path.as_deref())
                 .or(self.bios_path.as_deref()),
             _ => self.bios_path.as_deref(),
         }
@@ -606,10 +628,10 @@ impl VMKernelConfig {
                         "UEFI boot requires uefi_firmware_path or legacy bios_path"
                     ));
                 }
-                if self.bios_load_addr.is_none() {
+                if self.bios_load_addr.is_none() && self.ovmf_code_base.is_none() {
                     return Err(ax_errno::ax_err_type!(
                         InvalidInput,
-                        "UEFI boot requires bios_load_addr"
+                        "UEFI boot requires bios_load_addr or ovmf_code_base"
                     ));
                 }
             }

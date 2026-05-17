@@ -43,6 +43,13 @@ pub struct RamdiskInfo {
     pub size: Option<usize>,
 }
 
+/// OVMF firmware image information.
+#[derive(Debug, Default, Clone)]
+pub struct OvmfInfo {
+    pub code_load_gpa: GuestPhysAddr,
+    pub vars_load_gpa: Option<GuestPhysAddr>,
+}
+
 /// A part of `AxVMConfig`, which stores configuration attributes related to the load address of VM images.
 #[derive(Debug, Default, Clone)]
 pub struct VMImageConfig {
@@ -52,6 +59,8 @@ pub struct VMImageConfig {
     pub loaded_from_filesystem: bool,
     /// The load address in GPA for the BIOS image, `None` if not used.
     pub bios_load_gpa: Option<GuestPhysAddr>,
+    /// OVMF firmware image information, `None` if not used.
+    pub ovmf: Option<OvmfInfo>,
     /// The load address in GPA for the device tree blob (DTB), `None` if not used.
     pub dtb_load_gpa: Option<GuestPhysAddr>,
     /// Ramdisk image info, `None` if not used.

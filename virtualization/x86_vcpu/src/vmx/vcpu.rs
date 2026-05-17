@@ -45,6 +45,7 @@ use super::{
     vmcs::{
         self, ApicAccessExitType, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16,
         VmcsGuest32, VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW,
+        VmcsReadOnly32, VmcsReadOnly64, VmcsReadOnlyNW,
     },
 };
 use crate::{
@@ -574,29 +575,35 @@ impl VmxVcpu {
         self.set_cr(4, 0);
 
         macro_rules! set_guest_segment {
-            ($seg:ident, $access_rights:expr) => {{
+            ($seg:ident, $selector:expr, $base:expr, $access_rights:expr) => {{
                 use VmcsGuest16::*;
                 use VmcsGuest32::*;
                 use VmcsGuestNW::*;
                 paste::paste! {
-                    [<$seg _SELECTOR>].write(0)?;
-                    [<$seg _BASE>].write(0)?;
+                    [<$seg _SELECTOR>].write($selector)?;
+                    [<$seg _BASE>].write($base)?;
                     [<$seg _LIMIT>].write(0xffff)?;
                     [<$seg _ACCESS_RIGHTS>].write($access_rights)?;
                 }
             }};
         }
 
-        set_guest_segment!(ES, 0x93); // 16-bit, present, data, read/write, accessed
-        set_guest_segment!(CS, 0x9b); // 16-bit, present, code, exec/read, accessed
-        VmcsGuest16::CS_SELECTOR.write(entry_state.cs_selector)?;
-        VmcsGuestNW::CS_BASE.write(entry_state.cs_base)?;
-        set_guest_segment!(SS, 0x93);
-        set_guest_segment!(DS, 0x93);
-        set_guest_segment!(FS, 0x93);
-        set_guest_segment!(GS, 0x93);
-        set_guest_segment!(TR, 0x8b); // present, system, 32-bit TSS busy
-        set_guest_segment!(LDTR, 0x82); // present, system, LDT
+        info!(
+            "VMX guest entry setup: entry={:#x}, cs={:#x}, cs_base={:#x}, rip={:#x}",
+            entry.as_usize(),
+            entry_state.cs_selector,
+            entry_state.cs_base,
+            entry_state.rip
+        );
+
+        set_guest_segment!(ES, 0, 0, 0x93); // 16-bit, present, data, read/write, accessed
+        set_guest_segment!(CS, entry_state.cs_selector, entry_state.cs_base, 0x9b); // 16-bit, present, code, exec/read, accessed
+        set_guest_segment!(SS, 0, 0, 0x93);
+        set_guest_segment!(DS, 0, 0, 0x93);
+        set_guest_segment!(FS, 0, 0, 0x93);
+        set_guest_segment!(GS, 0, 0, 0x93);
+        set_guest_segment!(TR, 0, 0, 0x8b); // present, system, 32-bit TSS busy
+        set_guest_segment!(LDTR, 0, 0, 0x82); // present, system, LDT
 
         VmcsGuestNW::GDTR_BASE.write(0)?;
         VmcsGuest32::GDTR_LIMIT.write(0xffff)?;
@@ -749,8 +756,8 @@ impl VmxVcpu {
         // VmcsControlNW::CR4_GUEST_HOST_MASK.write(0)?;
         VmcsControl32::CR3_TARGET_COUNT.write(0)?;
 
-        // Pass-through exceptions (except #UD(6)), don't use I/O bitmap, set MSR bitmaps.
-        let exception_bitmap: u32 = 1 << 6;
+        // Intercept common early firmware faults so the first exception is visible before a triple fault.
+        let exception_bitmap: u32 = (1 << 6) | (1 << 8) | (1 << 13) | (1 << 14);
 
         self.setup_io_bitmap(config)?;
 
@@ -1566,6 +1573,78 @@ impl VmxVcpu {
         }
     }
 
+    fn dump_exception_exit_info(&self, exit_info: &VmxExitInfo) -> AxResult {
+        let intr_info = self.interrupt_exit_info()?;
+        let raw_intr_info = VmcsReadOnly32::VMEXIT_INTERRUPTION_INFO.read().unwrap_or(0);
+        let raw_idt_info = VmcsReadOnly32::IDT_VECTORING_INFO.read().unwrap_or(0);
+        let raw_idt_err = VmcsReadOnly32::IDT_VECTORING_ERR_CODE.read().unwrap_or(0);
+        let exit_qualification = VmcsReadOnlyNW::EXIT_QUALIFICATION.read().unwrap_or(0);
+        let guest_linear_addr = VmcsReadOnlyNW::GUEST_LINEAR_ADDR.read().unwrap_or(0);
+        let guest_physical_addr = VmcsReadOnly64::GUEST_PHYSICAL_ADDR.read().unwrap_or(0);
+
+        warn!(
+            "VMX exception/NMI VM-Exit: {exit_info:#x?}, intr_info={intr_info:#x?}, vector_name={}",
+            exception_vector_name(intr_info.vector)
+        );
+        warn!(
+            "VMX exception raw fields: intr_info={raw_intr_info:#x}, idt_info={raw_idt_info:#x}, idt_err={raw_idt_err:#x}, qualification={exit_qualification:#x}, gla={guest_linear_addr:#x}, gpa={guest_physical_addr:#x}"
+        );
+        warn!(
+            "VMX guest state: rip={:#x}, rsp={:#x}, rflags={:#x}, cr0={:#x}, cr3={:#x}, cr4={:#x}, efer={:#x}",
+            VmcsGuestNW::RIP.read()?,
+            VmcsGuestNW::RSP.read()?,
+            VmcsGuestNW::RFLAGS.read()?,
+            VmcsGuestNW::CR0.read()?,
+            VmcsGuestNW::CR3.read()?,
+            VmcsGuestNW::CR4.read()?,
+            VmcsGuest64::IA32_EFER.read()?,
+        );
+        warn!(
+            "VMX guest CS: selector={:#x}, base={:#x}, limit={:#x}, access_rights={:#x}",
+            VmcsGuest16::CS_SELECTOR.read()?,
+            VmcsGuestNW::CS_BASE.read()?,
+            VmcsGuest32::CS_LIMIT.read()?,
+            VmcsGuest32::CS_ACCESS_RIGHTS.read()?,
+        );
+        warn!("VCpu {self:#x?}");
+
+        Ok(())
+    }
+
+    fn dump_triple_fault_exit_info(&self, exit_info: &VmxExitInfo) -> AxResult {
+        let raw_intr_info = VmcsReadOnly32::VMEXIT_INTERRUPTION_INFO.read().unwrap_or(0);
+        let raw_idt_info = VmcsReadOnly32::IDT_VECTORING_INFO.read().unwrap_or(0);
+        let raw_idt_err = VmcsReadOnly32::IDT_VECTORING_ERR_CODE.read().unwrap_or(0);
+        let exit_qualification = VmcsReadOnlyNW::EXIT_QUALIFICATION.read().unwrap_or(0);
+        let guest_linear_addr = VmcsReadOnlyNW::GUEST_LINEAR_ADDR.read().unwrap_or(0);
+        let guest_physical_addr = VmcsReadOnly64::GUEST_PHYSICAL_ADDR.read().unwrap_or(0);
+
+        warn!("VMX triple fault VM-Exit: {exit_info:#x?}");
+        warn!(
+            "VMX triple fault raw fields: intr_info={raw_intr_info:#x}, idt_info={raw_idt_info:#x}, idt_err={raw_idt_err:#x}, qualification={exit_qualification:#x}, gla={guest_linear_addr:#x}, gpa={guest_physical_addr:#x}"
+        );
+        warn!(
+            "VMX triple fault guest state: rip={:#x}, rsp={:#x}, rflags={:#x}, cr0={:#x}, cr3={:#x}, cr4={:#x}, efer={:#x}",
+            VmcsGuestNW::RIP.read()?,
+            VmcsGuestNW::RSP.read()?,
+            VmcsGuestNW::RFLAGS.read()?,
+            VmcsGuestNW::CR0.read()?,
+            VmcsGuestNW::CR3.read()?,
+            VmcsGuestNW::CR4.read()?,
+            VmcsGuest64::IA32_EFER.read()?,
+        );
+        warn!(
+            "VMX triple fault guest CS: selector={:#x}, base={:#x}, limit={:#x}, access_rights={:#x}",
+            VmcsGuest16::CS_SELECTOR.read()?,
+            VmcsGuestNW::CS_BASE.read()?,
+            VmcsGuest32::CS_LIMIT.read()?,
+            VmcsGuest32::CS_ACCESS_RIGHTS.read()?,
+        );
+        warn!("VCpu {self:#x?}");
+
+        Ok(())
+    }
+
     fn load_guest_xstate(&mut self) {
         self.xstate.switch_to_guest();
     }
@@ -1579,6 +1658,32 @@ impl Drop for VmxVcpu {
     fn drop(&mut self) {
         unsafe { vmx::vmclear(self.vmcs.phys_addr().as_usize() as u64).unwrap() };
         info!("[HV] dropped VmxVcpu(vmcs: {:#x})", self.vmcs.phys_addr());
+    }
+}
+
+fn exception_vector_name(vector: u8) -> &'static str {
+    match vector {
+        0 => "#DE divide error",
+        1 => "#DB debug",
+        2 => "NMI",
+        3 => "#BP breakpoint",
+        4 => "#OF overflow",
+        5 => "#BR bound range exceeded",
+        6 => "#UD invalid opcode",
+        7 => "#NM device not available",
+        8 => "#DF double fault",
+        10 => "#TS invalid TSS",
+        11 => "#NP segment not present",
+        12 => "#SS stack segment fault",
+        13 => "#GP general protection",
+        14 => "#PF page fault",
+        16 => "#MF x87 floating-point exception",
+        17 => "#AC alignment check",
+        18 => "#MC machine check",
+        19 => "#XM SIMD floating-point exception",
+        20 => "#VE virtualization exception",
+        21 => "#CP control protection exception",
+        _ => "unknown vector",
     }
 }
 
@@ -1776,6 +1881,14 @@ impl AxArchVCpu for VmxVcpu {
                                 value,
                             }
                         }
+                    }
+                    VmxExitReason::EXCEPTION_NMI => {
+                        self.dump_exception_exit_info(&exit_info)?;
+                        AxVCpuExitReason::Halt
+                    }
+                    VmxExitReason::TRIPLE_FAULT => {
+                        self.dump_triple_fault_exit_info(&exit_info)?;
+                        AxVCpuExitReason::Halt
                     }
                     _ => {
                         warn!("VMX unsupported VM-Exit: {exit_info:#x?}");

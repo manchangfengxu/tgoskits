@@ -1,0 +1,68 @@
+# Vm base info configs
+#
+[base]
+# Guest vm id.
+id = 1
+# Guest vm name.
+name = "ovmf-x86_64-qemu"
+# Virtualization type.
+vm_type = 1
+# The number of virtual CPUs.
+cpu_num = 1
+# Guest vm physical cpu sets.
+phys_cpu_sets = [1]
+
+#
+# Vm kernel / firmware configs
+#
+[kernel]
+# UEFI guests should enter through the x86 reset vector.
+entry_point = 0xffff_fff0
+# UEFI boot mode is now parsed from the existing [kernel] section.
+boot = "uefi"
+# The location of image: "memory" | "fs".
+image_location = "fs"
+# Kept only because the current common config model still requires this field.
+kernel_path = "/guest/uefi/empty-kernel-placeholder.bin"
+# Kept as a legacy-required field; UEFI loading uses ovmf_code_base instead.
+kernel_load_addr = 0x20_0000
+# OVMF is not the current low-address AxVisor BIOS/trampoline image.
+enable_bios = false
+
+# Read-only OVMF firmware code image.
+ovmf_code_path = "/guest/ovmf/OVMF_CODE.fd"
+# Place OVMF_CODE so its reset-vector bytes land at GPA 0xffff_fff0.
+ovmf_code_base = 0xffc8_4000
+# Writable UEFI variable store image.
+ovmf_vars_path = "/guest/ovmf/OVMF_VARS.fd"
+# OVMF_VARS occupies the lower part of the 4 MiB flash window.
+ovmf_vars_base = 0xffc0_0000
+# Explicit reset vector used to seed BSP entry during the first-stage adapter.
+reset_vector = 0xffff_fff0
+
+# Memory regions with format (`base_paddr`, `size`, `flags`, `map_type`).
+# For `map_type`, 0 means `MAP_ALLOC`, 1 means `MAP_IDENTICAL`, 2 means `MAP_RESERVED`.
+memory_regions = [
+  [0x0000_0000, 0x0400_0000, 0x7, 0], # Low RAM 64M 0b111 R|W|EXECUTE
+  [0xffc0_0000, 0x0040_0000, 0x7, 0], # Firmware window for OVMF_VARS + OVMF_CODE
+]
+
+#
+# Device specifications
+#
+[devices]
+# Keep passthrough for the current AxVisor x86_64 baseline. A later UEFI stage
+# should move toward emulated/virtual interrupt controllers for a PC platform.
+interrupt_mode = "passthrough"
+
+# Emu_devices.
+# Name Base-Ipa Ipa_len Alloc-Irq Emu-Type EmuConfig.
+emu_devices = []
+
+# Pass-through devices.
+# Name Base-Ipa Base-Pa Length Alloc-Irq.
+passthrough_devices = [
+  ["IO APIC", 0xfec0_0000, 0xfec0_0000, 0x1000, 0x1],
+  ["Local APIC", 0xfee0_0000, 0xfee0_0000, 0x1000, 0x1],
+  ["HPET", 0xfed0_0000, 0xfed0_0000, 0x1000, 0x1],
+]
