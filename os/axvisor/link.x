@@ -1,1 +1,1 @@
-/home/ssdns/code/tgoskits/os/axvisor/target/x86_64-unknown-none/release/linker.x
+/home/ssdns/work/axvisor-uefi/tgoskits/os/axvisor/scripts/lds/linker.lds.S

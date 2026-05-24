@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::ops::Range;
 
 #[cfg(target_arch = "aarch64")]
@@ -33,6 +33,59 @@ use riscv_vplic::VPlicGlobal;
 use x86_vlapic::{EmulatedIoApic, EmulatedPit, EmulatedSerialPort, IoApicInterrupt};
 
 use crate::{AxVmDeviceConfig, range_alloc::RangeAllocator};
+
+const OVMF_DEBUGCON_PORT: u16 = 0x402;
+
+struct OvmfDebugConDevice {
+    line: Mutex<String>,
+}
+
+impl OvmfDebugConDevice {
+    fn new() -> Self {
+        Self {
+            line: Mutex::new(String::new()),
+        }
+    }
+}
+
+impl BaseDeviceOps<PortRange> for OvmfDebugConDevice {
+    fn emu_type(&self) -> EmulatedDeviceType {
+        EmulatedDeviceType::Console
+    }
+
+    fn address_range(&self) -> PortRange {
+        PortRange::new(
+            Port::new(OVMF_DEBUGCON_PORT),
+            Port::new(OVMF_DEBUGCON_PORT),
+        )
+    }
+
+    fn handle_read(&self, _addr: Port, _width: AccessWidth) -> AxResult<usize> {
+        Ok(0xE9)
+    }
+
+    fn handle_write(
+        &self,
+        _addr: Port,
+        width: AccessWidth,
+        val: usize,
+    ) -> AxResult {
+        if width == AccessWidth::Byte {
+            let byte = val as u8;
+            let mut line = self.line.lock();
+            if byte == b'\n' {
+                info!("OVMF debugcon: {}", line.as_str());
+                line.clear();
+            } else if byte != b'\r' {
+                line.push(byte as char);
+            }
+        } else {
+            info!("OVMF debugcon write: width={width:?} val={val:#x}");
+        }
+        Ok(())
+    }
+}
+
 
 /// A set of emulated device types that can be accessed by a specific address range type.
 pub struct AxEmuDevices<R: DeviceAddrRange> {
@@ -147,6 +200,10 @@ impl AxVmDevices {
         };
 
         Self::init(&mut this, &config.emu_configs);
+        #[cfg(target_arch = "x86_64")]
+        {
+            this.add_port_dev(Arc::new(OvmfDebugConDevice::new()));
+        }
         this
     }
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, format, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, sync::Arc, vec, vec::Vec};
 use core::{alloc::Layout, fmt};
 
 use ax_cpumask::CpuMask;
@@ -21,7 +21,7 @@ use ax_kspin::SpinNoIrq as Mutex;
 use ax_memory_addr::{align_down_4k, align_up_4k};
 use axaddrspace::{AddrSpace, MappingFlags};
 use axdevice::{AxVmDeviceConfig, AxVmDevices};
-use axdevice_base::AccessWidth;
+use axdevice_base::{AccessWidth, Port};
 use axvcpu::{AxVCpu, AxVCpuExitReason};
 #[cfg(target_arch = "x86_64")]
 use axvm_types::EmulatedDeviceType;
@@ -42,6 +42,37 @@ use crate::{
 
 const VM_ASPACE_BASE: usize = 0x0;
 const VM_ASPACE_SIZE: usize = 0x7fff_ffff_f000;
+
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_IO_SELECTOR: u16 = 0x510;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_IO_DATA: u16 = 0x511;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_IO_DMA_ADDRESS: u16 = 0x514;
+#[cfg(target_arch = "x86_64")]
+const QEMU_FW_CFG_FNAME_SIZE: usize = 56;
+#[cfg(target_arch = "x86_64")]
+const QEMU_FW_CFG_ITEM_SIGNATURE: u16 = 0x0000;
+#[cfg(target_arch = "x86_64")]
+const QEMU_FW_CFG_ITEM_INTERFACE_VERSION: u16 = 0x0001;
+#[cfg(target_arch = "x86_64")]
+const QEMU_FW_CFG_ITEM_SMP_CPU_COUNT: u16 = 0x0005;
+#[cfg(target_arch = "x86_64")]
+const QEMU_FW_CFG_ITEM_FILE_DIR: u16 = 0x0019;
+#[cfg(target_arch = "x86_64")]
+const QEMU_FW_CFG_ITEM_ETC_E820: u16 = 0x8000;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_F_DMA: u32 = 1 << 1;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_DMA_CTL_ERROR: u32 = 1 << 0;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_DMA_CTL_READ: u32 = 1 << 1;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_DMA_CTL_SKIP: u32 = 1 << 2;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_DMA_CTL_SELECT: u32 = 1 << 3;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_DMA_CTL_WRITE: u32 = 1 << 4;
 
 /// A vCPU with architecture-independent interface.
 type VCpu = AxVCpu<AxArchVCpuImpl>;
@@ -113,6 +144,135 @@ struct AxVMInnerMut {
     memory_regions: Vec<VMMemoryRegion>,
     config: AxVMConfig,
     vm_status: VMStatus,
+    #[cfg(target_arch = "x86_64")]
+    fw_cfg: FwCfgState,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct FwCfgState {
+    selector: u16,
+    offset: usize,
+    dma_address: u64,
+    dma_bytes: [u8; 8],
+    dma_bytes_written: usize,
+    items: BTreeMap<u16, Vec<u8>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl FwCfgState {
+    fn new() -> Self {
+        Self {
+            selector: 0,
+            offset: 0,
+            dma_address: 0,
+            dma_bytes: [0; 8],
+            dma_bytes_written: 0,
+            items: BTreeMap::new(),
+        }
+    }
+
+    fn configure(&mut self, memory_regions: &[VMMemoryRegion], cpu_count: usize) {
+        self.items.clear();
+        self.items
+            .insert(QEMU_FW_CFG_ITEM_SIGNATURE, b"QEMU".to_vec());
+        self.items.insert(
+            QEMU_FW_CFG_ITEM_INTERFACE_VERSION,
+            FW_CFG_F_DMA.to_le_bytes().to_vec(),
+        );
+        self.items.insert(
+            QEMU_FW_CFG_ITEM_SMP_CPU_COUNT,
+            (cpu_count as u16).to_le_bytes().to_vec(),
+        );
+        self.items
+            .insert(QEMU_FW_CFG_ITEM_ETC_E820, Self::build_e820(memory_regions));
+        self.items
+            .insert(QEMU_FW_CFG_ITEM_FILE_DIR, self.build_file_dir());
+    }
+
+    fn build_e820(memory_regions: &[VMMemoryRegion]) -> Vec<u8> {
+        let mut e820 = Vec::new();
+        for region in memory_regions {
+            let gpa = region.gpa.as_usize();
+            if gpa >= 0x100000000 {
+                continue;
+            }
+            let end = (gpa + region.size()).min(0x100000000);
+            append_u64_le(&mut e820, gpa as u64);
+            append_u64_le(&mut e820, (end - gpa) as u64);
+            append_u32_le(&mut e820, 1);
+        }
+        e820
+    }
+
+    fn build_file_dir(&self) -> Vec<u8> {
+        let files = [("etc/e820", QEMU_FW_CFG_ITEM_ETC_E820)];
+        let mut dir = Vec::new();
+        append_u32_be(&mut dir, files.len() as u32);
+        for (name, selector) in files {
+            let data = self.items.get(&selector).expect("fw_cfg file item missing");
+            append_u32_be(&mut dir, data.len() as u32);
+            append_u16_be(&mut dir, selector);
+            append_u16_be(&mut dir, 0);
+            let mut name_bytes = [0u8; QEMU_FW_CFG_FNAME_SIZE];
+            let bytes = name.as_bytes();
+            name_bytes[..bytes.len()].copy_from_slice(bytes);
+            dir.extend_from_slice(&name_bytes);
+        }
+        dir
+    }
+
+    fn select(&mut self, selector: u16) {
+        self.selector = selector;
+        self.offset = 0;
+        debug!("fw_cfg select item={selector:#x}");
+    }
+
+    fn read_port(&mut self, width: AccessWidth) -> usize {
+        let mut value = 0usize;
+        let bytes = self.read_bytes(width.size());
+        for (index, byte) in bytes.iter().enumerate() {
+            value |= (*byte as usize) << (index * 8);
+        }
+        value
+    }
+
+    fn read_bytes(&mut self, size: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(size);
+        if let Some(item) = self.items.get(&self.selector) {
+            let end = (self.offset + size).min(item.len());
+            out.extend_from_slice(&item[self.offset..end]);
+            self.offset = end;
+        }
+        out.resize(size, 0);
+        out
+    }
+
+    fn skip_bytes(&mut self, size: usize) {
+        self.offset += size;
+        if let Some(item) = self.items.get(&self.selector) {
+            self.offset = self.offset.min(item.len());
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn append_u16_be(buffer: &mut Vec<u8>, value: u16) {
+    buffer.extend_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(target_arch = "x86_64")]
+fn append_u32_be(buffer: &mut Vec<u8>, value: u32) {
+    buffer.extend_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(target_arch = "x86_64")]
+fn append_u32_le(buffer: &mut Vec<u8>, value: u32) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(target_arch = "x86_64")]
+fn append_u64_le(buffer: &mut Vec<u8>, value: u64) {
+    buffer.extend_from_slice(&value.to_le_bytes());
 }
 
 /// VM status enumeration representing the lifecycle states of a virtual machine
@@ -192,6 +352,8 @@ impl AxVM {
                 config,
                 memory_regions: Vec::new(),
                 vm_status: VMStatus::Loading,
+                #[cfg(target_arch = "x86_64")]
+                fw_cfg: FwCfgState::new(),
             }),
         });
 
@@ -217,6 +379,7 @@ impl AxVM {
 
         let dtb_addr = inner_mut.config.image_config().dtb_load_gpa;
         let vcpu_id_pcpu_sets = inner_mut.config.phys_cpu_ls.get_vcpu_affinities_pcpu_ids();
+        let fw_cfg_cpu_count = vcpu_id_pcpu_sets.len();
 
         info!("dtb_load_gpa: {dtb_addr:?}");
         debug!("id: {}, VCpuIdPCpuSets: {vcpu_id_pcpu_sets:#x?}", self.id());
@@ -257,6 +420,12 @@ impl AxVM {
                 #[cfg(target_arch = "x86_64")]
                 (),
             )?));
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let memory_regions = inner_mut.memory_regions.clone();
+            inner_mut.fw_cfg.configure(&memory_regions, fw_cfg_cpu_count);
         }
 
         let mut pt_dev_region = Vec::new();
@@ -600,6 +769,13 @@ impl AxVM {
                             .handle_mmio_write(addr, width, data as usize)?;
                     }
                     AxVCpuExitReason::IoRead { port, width } => {
+                        #[cfg(target_arch = "x86_64")]
+                        let val = if let Some(val) = self.handle_fw_cfg_io_read(port, width)? {
+                            val
+                        } else {
+                            self.get_devices().handle_port_read(port, width)?
+                        };
+                        #[cfg(not(target_arch = "x86_64"))]
                         let val = self.get_devices().handle_port_read(port, width)?;
                         #[cfg(not(target_arch = "riscv64"))]
                         vcpu.set_gpr(0, val); // The target is always eax/ax/al, todo: handle access_width correctly
@@ -608,6 +784,10 @@ impl AxVM {
                         vcpu.set_gpr(riscv_vcpu::GprIndex::A0 as usize, val);
                     }
                     AxVCpuExitReason::IoWrite { port, width, data } => {
+                        #[cfg(target_arch = "x86_64")]
+                        if self.handle_fw_cfg_io_write(port, width, data as usize)? {
+                            continue;
+                        }
                         self.get_devices()
                             .handle_port_write(port, width, data as usize)?;
                     }
@@ -979,6 +1159,133 @@ impl AxVM {
             needs_dealloc: false, // This is a reserved region, not allocated
         });
         Ok(s)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn handle_fw_cfg_io_read(&self, port: Port, width: AccessWidth) -> AxResult<Option<usize>> {
+        let mut g = self.inner_mut.lock();
+        let value = match port.number() {
+            FW_CFG_IO_DATA => Some(g.fw_cfg.read_port(width)),
+            _ => None,
+        };
+        Ok(value)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn handle_fw_cfg_io_write(
+        &self,
+        port: Port,
+        width: AccessWidth,
+        val: usize,
+    ) -> AxResult<bool> {
+        match port.number() {
+            FW_CFG_IO_SELECTOR if width == AccessWidth::Word => {
+                self.inner_mut.lock().fw_cfg.select(val as u16);
+                Ok(true)
+            }
+            FW_CFG_IO_DMA_ADDRESS | 0x518 if width == AccessWidth::Dword => {
+                let mut descriptor = None;
+                {
+                    let mut g = self.inner_mut.lock();
+                    let fw_cfg = &mut g.fw_cfg;
+                    let part = u32::from_be(val as u32);
+                    if port.number() == FW_CFG_IO_DMA_ADDRESS {
+                        fw_cfg.dma_bytes[0..4].copy_from_slice(&part.to_be_bytes());
+                        fw_cfg.dma_bytes_written = 4;
+                    } else {
+                        fw_cfg.dma_bytes[4..8].copy_from_slice(&part.to_be_bytes());
+                        if fw_cfg.dma_bytes_written == 4 {
+                            let high = u32::from_be_bytes(fw_cfg.dma_bytes[0..4].try_into().unwrap()) as u64;
+                            let low = u32::from_be_bytes(fw_cfg.dma_bytes[4..8].try_into().unwrap()) as u64;
+                            fw_cfg.dma_address = (high << 32) | low;
+                            descriptor = Some(fw_cfg.dma_address);
+                        }
+                        fw_cfg.dma_bytes_written = 0;
+                    }
+                }
+                if let Some(descriptor) = descriptor {
+                    self.handle_fw_cfg_dma(GuestPhysAddr::from(descriptor as usize))?;
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn handle_fw_cfg_dma(&self, descriptor_gpa: GuestPhysAddr) -> AxResult {
+        let mut descriptor = [0u8; 16];
+        let mut g = self.inner_mut.lock();
+        Self::read_guest_bytes_locked(&g.address_space, descriptor_gpa, &mut descriptor)?;
+
+        let control = u32::from_be_bytes(descriptor[0..4].try_into().unwrap());
+        let length = u32::from_be_bytes(descriptor[4..8].try_into().unwrap()) as usize;
+        let address = u64::from_be_bytes(descriptor[8..16].try_into().unwrap()) as usize;
+        let data_gpa = GuestPhysAddr::from(address);
+        let mut status = 0u32;
+
+        if control & FW_CFG_DMA_CTL_SELECT != 0 {
+            g.fw_cfg.select((control >> 16) as u16);
+        }
+
+        if control & FW_CFG_DMA_CTL_READ != 0 {
+            let bytes = g.fw_cfg.read_bytes(length);
+            Self::write_guest_bytes_locked(&g.address_space, data_gpa, &bytes)?;
+        } else if control & FW_CFG_DMA_CTL_WRITE != 0 {
+            let mut bytes = vec![0u8; length];
+            Self::read_guest_bytes_locked(&g.address_space, data_gpa, &mut bytes)?;
+        } else if control & FW_CFG_DMA_CTL_SKIP != 0 {
+            g.fw_cfg.skip_bytes(length);
+        } else if control & FW_CFG_DMA_CTL_ERROR != 0 {
+            status = FW_CFG_DMA_CTL_ERROR;
+        }
+
+        Self::write_guest_bytes_locked(
+            &g.address_space,
+            descriptor_gpa,
+            &status.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn read_guest_bytes_locked(
+        address_space: &AddrSpace<HostPagingHandler>,
+        gpa: GuestPhysAddr,
+        buffer: &mut [u8],
+    ) -> AxResult {
+        match address_space.translated_byte_buffer(gpa, buffer.len()) {
+            Some(mut slices) => {
+                let mut copied = 0;
+                for slice in &mut slices {
+                    let take = (buffer.len() - copied).min(slice.len());
+                    buffer[copied..copied + take].copy_from_slice(&slice[..take]);
+                    copied += take;
+                }
+                Ok(())
+            }
+            None => ax_err!(InvalidInput, "failed to translate guest buffer"),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn write_guest_bytes_locked(
+        address_space: &AddrSpace<HostPagingHandler>,
+        gpa: GuestPhysAddr,
+        buffer: &[u8],
+    ) -> AxResult {
+        match address_space.translated_byte_buffer(gpa, buffer.len()) {
+            Some(mut slices) => {
+                let mut copied = 0;
+                for slice in &mut slices {
+                    let take = (buffer.len() - copied).min(slice.len());
+                    slice[..take].copy_from_slice(&buffer[copied..copied + take]);
+                    copied += take;
+                }
+                Ok(())
+            }
+            None => ax_err!(InvalidInput, "failed to translate guest buffer"),
+        }
     }
 
     /// Cleanup resources for the VM before drop.

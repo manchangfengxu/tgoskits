@@ -486,6 +486,9 @@ impl VmxVcpu {
                 true,
             );
         }
+        self.io_bitmap.set_intercept_of_range(0x402, 1, true);
+        self.io_bitmap.set_intercept_of_range(0x510, 2, true);
+        self.io_bitmap.set_intercept_of_range(0x514, 8, true);
         Ok(())
     }
 
@@ -1589,6 +1592,8 @@ impl VmxVcpu {
         warn!(
             "VMX exception raw fields: intr_info={raw_intr_info:#x}, idt_info={raw_idt_info:#x}, idt_err={raw_idt_err:#x}, qualification={exit_qualification:#x}, gla={guest_linear_addr:#x}, gpa={guest_physical_addr:#x}"
         );
+        dump_interruption_error_code("VMX exception", intr_info.vector, intr_info.err_code);
+        dump_idt_vectoring_info("VMX exception", raw_idt_info, raw_idt_err);
         warn!(
             "VMX guest state: rip={:#x}, rsp={:#x}, rflags={:#x}, cr0={:#x}, cr3={:#x}, cr4={:#x}, efer={:#x}",
             VmcsGuestNW::RIP.read()?,
@@ -1599,13 +1604,8 @@ impl VmxVcpu {
             VmcsGuestNW::CR4.read()?,
             VmcsGuest64::IA32_EFER.read()?,
         );
-        warn!(
-            "VMX guest CS: selector={:#x}, base={:#x}, limit={:#x}, access_rights={:#x}",
-            VmcsGuest16::CS_SELECTOR.read()?,
-            VmcsGuestNW::CS_BASE.read()?,
-            VmcsGuest32::CS_LIMIT.read()?,
-            VmcsGuest32::CS_ACCESS_RIGHTS.read()?,
-        );
+        self.dump_guest_descriptor_tables("VMX exception")?;
+        self.dump_guest_segments("VMX exception")?;
         warn!("VCpu {self:#x?}");
 
         Ok(())
@@ -1623,6 +1623,7 @@ impl VmxVcpu {
         warn!(
             "VMX triple fault raw fields: intr_info={raw_intr_info:#x}, idt_info={raw_idt_info:#x}, idt_err={raw_idt_err:#x}, qualification={exit_qualification:#x}, gla={guest_linear_addr:#x}, gpa={guest_physical_addr:#x}"
         );
+        dump_idt_vectoring_info("VMX triple fault", raw_idt_info, raw_idt_err);
         warn!(
             "VMX triple fault guest state: rip={:#x}, rsp={:#x}, rflags={:#x}, cr0={:#x}, cr3={:#x}, cr4={:#x}, efer={:#x}",
             VmcsGuestNW::RIP.read()?,
@@ -1633,15 +1634,56 @@ impl VmxVcpu {
             VmcsGuestNW::CR4.read()?,
             VmcsGuest64::IA32_EFER.read()?,
         );
+        self.dump_guest_descriptor_tables("VMX triple fault")?;
+        self.dump_guest_segments("VMX triple fault")?;
+        warn!("VCpu {self:#x?}");
+
+        Ok(())
+    }
+
+    fn dump_guest_descriptor_tables(&self, prefix: &str) -> AxResult {
         warn!(
-            "VMX triple fault guest CS: selector={:#x}, base={:#x}, limit={:#x}, access_rights={:#x}",
+            "{prefix} guest GDTR: base={:#x}, limit={:#x}; IDTR: base={:#x}, limit={:#x}",
+            VmcsGuestNW::GDTR_BASE.read()?,
+            VmcsGuest32::GDTR_LIMIT.read()?,
+            VmcsGuestNW::IDTR_BASE.read()?,
+            VmcsGuest32::IDTR_LIMIT.read()?,
+        );
+        Ok(())
+    }
+
+    fn dump_guest_segments(&self, prefix: &str) -> AxResult {
+        warn!(
+            "{prefix} guest segments: cs={:#x} base={:#x} limit={:#x} ar={:#x}, ss={:#x} base={:#x} limit={:#x} ar={:#x}, ds={:#x} base={:#x} limit={:#x} ar={:#x}, es={:#x} base={:#x} limit={:#x} ar={:#x}, fs={:#x} base={:#x} limit={:#x} ar={:#x}, gs={:#x} base={:#x} limit={:#x} ar={:#x}, tr={:#x} base={:#x} limit={:#x} ar={:#x}",
             VmcsGuest16::CS_SELECTOR.read()?,
             VmcsGuestNW::CS_BASE.read()?,
             VmcsGuest32::CS_LIMIT.read()?,
             VmcsGuest32::CS_ACCESS_RIGHTS.read()?,
+            VmcsGuest16::SS_SELECTOR.read()?,
+            VmcsGuestNW::SS_BASE.read()?,
+            VmcsGuest32::SS_LIMIT.read()?,
+            VmcsGuest32::SS_ACCESS_RIGHTS.read()?,
+            VmcsGuest16::DS_SELECTOR.read()?,
+            VmcsGuestNW::DS_BASE.read()?,
+            VmcsGuest32::DS_LIMIT.read()?,
+            VmcsGuest32::DS_ACCESS_RIGHTS.read()?,
+            VmcsGuest16::ES_SELECTOR.read()?,
+            VmcsGuestNW::ES_BASE.read()?,
+            VmcsGuest32::ES_LIMIT.read()?,
+            VmcsGuest32::ES_ACCESS_RIGHTS.read()?,
+            VmcsGuest16::FS_SELECTOR.read()?,
+            VmcsGuestNW::FS_BASE.read()?,
+            VmcsGuest32::FS_LIMIT.read()?,
+            VmcsGuest32::FS_ACCESS_RIGHTS.read()?,
+            VmcsGuest16::GS_SELECTOR.read()?,
+            VmcsGuestNW::GS_BASE.read()?,
+            VmcsGuest32::GS_LIMIT.read()?,
+            VmcsGuest32::GS_ACCESS_RIGHTS.read()?,
+            VmcsGuest16::TR_SELECTOR.read()?,
+            VmcsGuestNW::TR_BASE.read()?,
+            VmcsGuest32::TR_LIMIT.read()?,
+            VmcsGuest32::TR_ACCESS_RIGHTS.read()?,
         );
-        warn!("VCpu {self:#x?}");
-
         Ok(())
     }
 
@@ -1685,6 +1727,67 @@ fn exception_vector_name(vector: u8) -> &'static str {
         21 => "#CP control protection exception",
         _ => "unknown vector",
     }
+}
+
+fn dump_interruption_error_code(prefix: &str, vector: u8, err_code: Option<u32>) {
+    let Some(err_code) = err_code else {
+        return;
+    };
+    match vector {
+        10..=13 => {
+            let selector = err_code & !0x7;
+            let external = err_code.get_bit(0);
+            let table = match err_code.get_bits(1..3) {
+                0 => "GDT",
+                1 => "IDT",
+                2 => "LDT",
+                3 => "IDT",
+                _ => "unknown",
+            };
+            warn!(
+                "{prefix} exception error code decode: raw={err_code:#x}, selector={selector:#x}, index={:#x}, table={}, external={}",
+                selector >> 3,
+                table,
+                external,
+            );
+        }
+        14 => warn!(
+            "{prefix} page-fault error code decode: raw={err_code:#x}, present={}, write={}, user={}, reserved={}, instruction_fetch={}",
+            err_code.get_bit(0),
+            err_code.get_bit(1),
+            err_code.get_bit(2),
+            err_code.get_bit(3),
+            err_code.get_bit(4),
+        ),
+        _ => warn!("{prefix} exception error code: raw={err_code:#x}"),
+    }
+}
+
+fn dump_idt_vectoring_info(prefix: &str, raw_idt_info: u32, idt_err: u32) {
+    if !raw_idt_info.get_bit(31) {
+        warn!("{prefix} IDT-vectoring decode: invalid");
+        return;
+    }
+    let vector = raw_idt_info.get_bits(0..8) as u8;
+    let interruption_type = raw_idt_info.get_bits(8..11);
+    let interruption_type_name = match interruption_type {
+        0 => "external interrupt",
+        1 => "reserved",
+        2 => "NMI",
+        3 => "hardware exception",
+        4 => "software interrupt",
+        5 => "privileged software exception",
+        6 => "software exception",
+        7 => "other event",
+        _ => "unknown",
+    };
+    let has_error_code = raw_idt_info.get_bit(11);
+    warn!(
+        "{prefix} IDT-vectoring decode: vector={vector:#x} {}, type={interruption_type:#x} ({interruption_type_name}), has_error_code={}, err={idt_err:#x}",
+        exception_vector_name(vector),
+        has_error_code,
+    );
+    dump_interruption_error_code(prefix, vector, has_error_code.then_some(idt_err));
 }
 
 fn get_tr_base(tr: SegmentSelector, gdt: &DescriptorTablePointer<u64>) -> u64 {
