@@ -80,6 +80,10 @@ pub enum VmCpuMode {
 }
 
 const MSR_IA32_EFER_LMA_BIT: u64 = 1 << 10;
+const IA32_MTRR_DEF_TYPE: u32 = 0x2ff;
+const MTRR_CACHE_WRITE_BACK: u64 = 0x6;
+const MTRR_DEF_TYPE_ENABLE: u64 = 1 << 11;
+const GUEST_MTRR_DEF_TYPE_INIT: u64 = MTRR_DEF_TYPE_ENABLE | MTRR_CACHE_WRITE_BACK;
 const CR0_PE: usize = 1 << 0;
 
 fn secondary_control_bits_allowed(bits: u32) -> bool {
@@ -134,6 +138,8 @@ pub struct VmxVcpu {
     vlapic: EmulatedLocalApic,
     /// Guest CR2 is not saved or restored by VMX hardware.
     guest_cr2: usize,
+    /// Guest-visible IA32_MTRR_DEF_TYPE shadow value.
+    mtrr_def_type: u64,
 
     // Extra states
     /// The XState of the VCpu. Both host and guest.
@@ -163,6 +169,7 @@ impl VmxVcpu {
             pending_events: VecDeque::with_capacity(8),
             vlapic: EmulatedLocalApic::new(vm_id, vcpu_id),
             guest_cr2: 0,
+            mtrr_def_type: GUEST_MTRR_DEF_TYPE_INIT,
             xstate: XState::new(),
             #[cfg(feature = "tracing")]
             guest_regs_exiting: GeneralRegisters::default(),
@@ -494,7 +501,7 @@ impl VmxVcpu {
 
     #[allow(dead_code)]
     fn setup_msr_bitmap(&mut self) -> AxResult {
-        // Intercept IA32_APIC_BASE MSR accesses
+        // Intercept IA32_APIC_BASE so we can track xAPIC/x2APIC mode switches in the vLAPIC.
         const IA32_APIC_BASE: u32 = 0x1b;
         self.msr_bitmap.set_read_intercept(IA32_APIC_BASE, true);
         self.msr_bitmap.set_write_intercept(IA32_APIC_BASE, true);
@@ -506,6 +513,10 @@ impl VmxVcpu {
             .set_write_intercept(IA32_UMWAIT_CONTROL, true);
         self.msr_bitmap
             .set_read_intercept(IA32_UMWAIT_CONTROL, true);
+        self.msr_bitmap
+            .set_read_intercept(IA32_MTRR_DEF_TYPE, true);
+        self.msr_bitmap
+            .set_write_intercept(IA32_MTRR_DEF_TYPE, true);
 
         // Intercept all x2APIC MSR accesses
         for msr in 0x800..=0x83f {
@@ -975,10 +986,6 @@ impl VmxVcpu {
     fn builtin_vmexit_handler(&mut self, exit_info: &VmxExitInfo) -> Option<AxResult> {
         const APIC_BASE_MSR: u32 = 0x1b;
         const AMD64_DE_CFG: u32 = 0xc001_1029;
-        // Following vm-exits are handled here:
-        // - interrupt window: turn off interrupt window;
-        // - xsetbv: set guest xcr;
-        // - cr access: just panic;
         match exit_info.exit_reason {
             VmxExitReason::INTERRUPT_WINDOW => Some(self.handle_interrupt_window()),
             VmxExitReason::XSETBV => Some(self.handle_xsetbv()),
@@ -988,6 +995,11 @@ impl VmxVcpu {
                 if self.regs().rcx as u32 == APIC_BASE_MSR =>
             {
                 Some(self.handle_apic_base_msr_access(msr_rw == VmxExitReason::MSR_WRITE))
+            }
+            msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
+                if self.regs().rcx as u32 == IA32_MTRR_DEF_TYPE =>
+            {
+                Some(self.handle_mtrr_def_type_msr(msr_rw == VmxExitReason::MSR_WRITE))
             }
             msr_rw @ (VmxExitReason::MSR_READ | VmxExitReason::MSR_WRITE)
                 if self.regs().rcx as u32 == AMD64_DE_CFG =>
@@ -1007,6 +1019,18 @@ impl VmxVcpu {
     fn write_edx_eax(&mut self, val: u64) {
         self.regs_mut().rax = val & 0xffff_ffff;
         self.regs_mut().rdx = val >> 32;
+    }
+
+    fn handle_mtrr_def_type_msr(&mut self, write: bool) -> AxResult {
+        const VMEXIT_INSTR_LEN_RDMSR_WRMSR: u8 = 2;
+
+        self.advance_rip(VMEXIT_INSTR_LEN_RDMSR_WRMSR)?;
+        if write {
+            self.mtrr_def_type = self.read_edx_eax();
+        } else {
+            self.write_edx_eax(self.mtrr_def_type);
+        }
+        Ok(())
     }
 
     fn handle_apic_base_msr_access(&mut self, write: bool) -> AxResult {

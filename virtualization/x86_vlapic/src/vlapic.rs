@@ -85,6 +85,9 @@ impl VirtualApicRegs {
     /// Create new virtual-APIC registers by allocating a 4-KByte page for the virtual-APIC page.
     pub fn new(vm_id: VMId, vcpu_id: VCpuId) -> Self {
         let apic_frame = PhysFrame::alloc_zero().expect("allocate virtual-APIC page failed");
+        let apic_base_init = DEFAULT_APIC_BASE as u64
+            | APIC_BASE_ENABLE
+            | if vcpu_id == 0 { APIC_BASE_BSP } else { 0 };
         let regs = Self {
             // virtual-APIC ID is the same as the VCPU ID.
             vapic_id: vcpu_id as _,
@@ -95,11 +98,7 @@ impl VirtualApicRegs {
             svr_last: SpuriousInterruptVectorRegisterLocal::new(RESET_SPURIOUS_INTERRUPT_VECTOR),
             lvt_last: LocalVectorTable::default(),
             isrv: 0,
-            apic_base: ApicBaseRegisterMsr::new(
-                DEFAULT_APIC_BASE as u64
-                    | APIC_BASE_ENABLE
-                    | if vcpu_id == 0 { APIC_BASE_BSP } else { 0 },
-            ),
+            apic_base: ApicBaseRegisterMsr::new(apic_base_init),
             virtual_timer: ApicTimer::new(vm_id, vcpu_id),
         };
         regs.regs().ID.set((vcpu_id as u32) << 24);

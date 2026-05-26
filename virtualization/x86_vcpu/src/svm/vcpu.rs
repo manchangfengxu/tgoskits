@@ -77,6 +77,10 @@ const SVM_UNSUPPORTED_GUEST_CR4: u64 = CR4_UMIP
 const X2APIC_MSR_BASE: u32 = 0x800;
 // Match the current VMX/vLAPIC path, which handles x2APIC register offsets 0x00..=0x3f.
 const X2APIC_MSR_END: u32 = 0x83f;
+const IA32_MTRR_DEF_TYPE: u32 = 0x2ff;
+const MTRR_CACHE_WRITE_BACK: u64 = 0x6;
+const MTRR_DEF_TYPE_ENABLE: u64 = 1 << 11;
+const GUEST_MTRR_DEF_TYPE_INIT: u64 = MTRR_DEF_TYPE_ENABLE | MTRR_CACHE_WRITE_BACK;
 
 const SVM_INT_CTL_V_IRQ: u32 = 1 << 8;
 const SVM_INT_CTL_V_INTR_PRIO_SHIFT: u32 = 16;
@@ -202,6 +206,7 @@ pub struct SvmVcpu {
     pending_events: VecDeque<PendingEvent>,
     /// Emulated Local APIC for x2APIC MSR accesses.
     vlapic: EmulatedLocalApic,
+    mtrr_def_type: u64,
     /// The XState of the VCpu. Both host and guest.
     xstate: XState,
 }
@@ -221,6 +226,7 @@ impl SvmVcpu {
             msrpm: MSRPm::passthrough_all()?,
             pending_events: VecDeque::with_capacity(8),
             vlapic: EmulatedLocalApic::new(vm_id, vcpu_id),
+            mtrr_def_type: GUEST_MTRR_DEF_TYPE_INIT,
             xstate: XState::new(),
         };
         info!("[HV] created SvmVcpu(vmcb: {:#x})", vcpu.vmcb.phys_addr());
@@ -351,6 +357,10 @@ impl SvmVcpu {
         self.msrpm.set_write_intercept(IA32_UMWAIT_CONTROL, true);
         self.msrpm.set_read_intercept(AMD64_DE_CFG, true);
         self.msrpm.set_write_intercept(AMD64_DE_CFG, true);
+        // Keep MTRR default type under software control so OVMF does not observe
+        // host FE state during PEI.
+        self.msrpm.set_read_intercept(IA32_MTRR_DEF_TYPE, true);
+        self.msrpm.set_write_intercept(IA32_MTRR_DEF_TYPE, true);
         // Route x2APIC MSRs through the emulated local APIC instead of the host APIC.
         for msr in X2APIC_MSR_BASE..=X2APIC_MSR_END {
             self.msrpm.set_read_intercept(msr, true);
@@ -578,6 +588,9 @@ impl SvmVcpu {
             Ok(SvmExitCode::MSR) if self.regs().rcx as u32 == Msr::IA32_EFER as u32 => {
                 Some(self.handle_efer_msr(exit_info))
             }
+            Ok(SvmExitCode::MSR) if self.regs().rcx as u32 == IA32_MTRR_DEF_TYPE => {
+                Some(self.handle_mtrr_def_type_msr(exit_info))
+            }
             Ok(SvmExitCode::MSR)
                 if (X2APIC_MSR_BASE..=X2APIC_MSR_END).contains(&(self.regs().rcx as u32)) =>
             {
@@ -635,6 +648,16 @@ impl SvmVcpu {
             self.write_edx_eax(self.vlapic.apic_base());
         } else {
             self.vlapic.set_apic_base(self.read_edx_eax())?;
+        }
+        self.advance_rip(VM_EXIT_INSTR_LEN_MSR)
+    }
+
+    fn handle_mtrr_def_type_msr(&mut self, exit_info: &super::vmcb::SvmExitInfo) -> AxResult {
+        const VM_EXIT_INSTR_LEN_MSR: u8 = 2;
+        if exit_info.exit_info_1 == 0 {
+            self.write_edx_eax(self.mtrr_def_type);
+        } else {
+            self.mtrr_def_type = self.read_edx_eax();
         }
         self.advance_rip(VM_EXIT_INSTR_LEN_MSR)
     }
