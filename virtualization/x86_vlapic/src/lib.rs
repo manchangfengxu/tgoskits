@@ -88,6 +88,19 @@ impl EmulatedLocalApic {
 }
 
 impl EmulatedLocalApic {
+    pub fn handle_xapic_write_offset(&self, offset: usize) -> AxResult {
+        let reg_off = xapic_mmio_access_reg_offset(GuestPhysAddr::from_usize(offset));
+        let value = self
+            .get_vlapic_regs()
+            .handle_read(reg_off, AccessWidth::Dword)?;
+        info!(
+            "[VLAPIC] APIC-write exit: offset={:#x} reg={} value={:#x}",
+            offset, reg_off, value
+        );
+        self.get_mut_vlapic_regs()
+            .handle_write(reg_off, value, AccessWidth::Dword)
+    }
+
     /// APIC-access address (64 bits).
     /// This field contains the physical address of the 4-KByte APIC-access page.
     /// If the “virtualize APIC accesses” VM-execution control is 1,

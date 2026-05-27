@@ -85,7 +85,9 @@ cfg_if::cfg_if! {
     if #[cfg(feature = "vmx")] {
         mod vmx;
         use vmx as vendor;
-        pub use vmx::{VmxExitInfo, VmxExitReason, VmxInterruptInfo, VmxIoExitInfo};
+        pub use vmx::{
+            EmulatedLocalApic, VmxExitInfo, VmxExitReason, VmxInterruptInfo, VmxIoExitInfo,
+        };
 
         pub use vendor::{
             VmxArchPerCpuState, VmxArchPerCpuState as X86ArchPerCpuState, VmxArchVCpu,

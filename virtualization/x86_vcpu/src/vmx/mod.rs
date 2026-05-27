@@ -21,7 +21,7 @@ mod vmcs;
 
 use ax_errno::ax_err_type;
 use axvcpu::HostPhysAddr;
-use x86_vlapic::EmulatedLocalApic;
+pub use x86_vlapic::EmulatedLocalApic;
 
 use self::structs::VmxBasic;
 pub use self::{

@@ -141,6 +141,10 @@ pub mod mock {
         fn nanos_to_ticks(nanos: u64) -> u64 {
             nanos
         }
+
+        fn current_vm_vcpu_num() -> usize {
+            1
+        }
     }
 
     impl MockMmHal {

@@ -46,6 +46,13 @@ mod x86_64 {
         fn nanos_to_ticks(nanos: u64) -> u64 {
             default_host().nanos_to_ticks(nanos)
         }
+
+        fn current_vm_vcpu_num() -> usize {
+            let vm_id = get_current_vcpu::<AxArchVCpuImpl>()
+                .expect("current x86 vCPU is not set")
+                .vm_id();
+            manager::with_vm(vm_id, |vm| vm.vcpu_num()).unwrap_or(0)
+        }
     }
 
     struct X86VlapicHostIfImpl;

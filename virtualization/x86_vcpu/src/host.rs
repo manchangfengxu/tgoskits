@@ -23,6 +23,9 @@ pub trait X86VcpuHostIf {
 
     /// Convert nanoseconds to host ticks.
     fn nanos_to_ticks(nanos: u64) -> u64;
+
+    /// Return the current VM vCPU count.
+    fn current_vm_vcpu_num() -> usize;
 }
 
 /// RAII host frame used by x86 VMX/SVM structures.
@@ -108,4 +111,9 @@ pub(crate) fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
 #[cfg(any(feature = "vmx", feature = "svm"))]
 pub(crate) fn nanos_to_ticks(nanos: u64) -> u64 {
     ax_crate_interface::call_interface!(X86VcpuHostIf::nanos_to_ticks(nanos))
+}
+
+#[cfg(any(feature = "vmx", feature = "svm"))]
+pub(crate) fn current_vm_vcpu_num() -> usize {
+    ax_crate_interface::call_interface!(X86VcpuHostIf::current_vm_vcpu_num())
 }

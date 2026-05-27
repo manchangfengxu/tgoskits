@@ -86,7 +86,6 @@ impl BaseDeviceOps<PortRange> for OvmfDebugConDevice {
     }
 }
 
-
 /// A set of emulated device types that can be accessed by a specific address range type.
 pub struct AxEmuDevices<R: DeviceAddrRange> {
     emu_devices: Vec<Arc<dyn BaseDeviceOps<R>>>,

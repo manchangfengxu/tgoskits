@@ -425,7 +425,22 @@ impl AxVM {
         #[cfg(target_arch = "x86_64")]
         {
             let memory_regions = inner_mut.memory_regions.clone();
-            inner_mut.fw_cfg.configure(&memory_regions, fw_cfg_cpu_count);
+            inner_mut
+                .fw_cfg
+                .configure(&memory_regions, fw_cfg_cpu_count);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            inner_mut.address_space.map_linear(
+                GuestPhysAddr::from(0xfee0_0000),
+                crate::vcpu::EmulatedLocalApic::virtual_apic_access_addr(),
+                0x1000,
+                MappingFlags::DEVICE
+                    | MappingFlags::READ
+                    | MappingFlags::WRITE
+                    | MappingFlags::USER,
+            )?;
         }
 
         let mut pt_dev_region = Vec::new();
@@ -1195,8 +1210,11 @@ impl AxVM {
                     } else {
                         fw_cfg.dma_bytes[4..8].copy_from_slice(&part.to_be_bytes());
                         if fw_cfg.dma_bytes_written == 4 {
-                            let high = u32::from_be_bytes(fw_cfg.dma_bytes[0..4].try_into().unwrap()) as u64;
-                            let low = u32::from_be_bytes(fw_cfg.dma_bytes[4..8].try_into().unwrap()) as u64;
+                            let high =
+                                u32::from_be_bytes(fw_cfg.dma_bytes[0..4].try_into().unwrap())
+                                    as u64;
+                            let low = u32::from_be_bytes(fw_cfg.dma_bytes[4..8].try_into().unwrap())
+                                as u64;
                             fw_cfg.dma_address = (high << 32) | low;
                             descriptor = Some(fw_cfg.dma_address);
                         }
@@ -1240,11 +1258,7 @@ impl AxVM {
             status = FW_CFG_DMA_CTL_ERROR;
         }
 
-        Self::write_guest_bytes_locked(
-            &g.address_space,
-            descriptor_gpa,
-            &status.to_be_bytes(),
-        )?;
+        Self::write_guest_bytes_locked(&g.address_space, descriptor_gpa, &status.to_be_bytes())?;
         Ok(())
     }
 

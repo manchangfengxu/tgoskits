@@ -88,6 +88,10 @@ impl VirtualApicRegs {
         let apic_base_init = DEFAULT_APIC_BASE as u64
             | APIC_BASE_ENABLE
             | if vcpu_id == 0 { APIC_BASE_BSP } else { 0 };
+        info!(
+            "[VLAPIC] init: vm={} vcpu={} IA32_APIC_BASE shadow={:#x}",
+            vm_id, vcpu_id, apic_base_init
+        );
         let regs = Self {
             // virtual-APIC ID is the same as the VCPU ID.
             vapic_id: vcpu_id as _,
@@ -135,7 +139,13 @@ impl VirtualApicRegs {
             ));
         }
 
+        let old = self.apic_base.get();
         self.apic_base.set(value);
+        info!(
+            "[VLAPIC] IA32_APIC_BASE shadow update: old={old:#x} new={value:#x} xapic={} x2apic={}",
+            self.is_xapic_enabled(),
+            self.is_x2apic_enabled()
+        );
         Ok(())
     }
 
@@ -354,6 +364,13 @@ impl VirtualApicRegs {
             APICDestination::AllIncludingSelf => {
                 dmask = host::current_vm_active_vcpus() as u64;
             }
+            APICDestination::AllExcludingSelf if host::current_vm_vcpu_num() == 1 => {
+                info!(
+                    "[VLAPIC] all-excluding-self destination has no target in single-vCPU VM: \
+                     vcpu={}",
+                    self.vapic_id
+                );
+            }
             APICDestination::AllExcludingSelf => {
                 dmask = host::current_vm_active_vcpus() as u64;
                 dmask &= !(1 << self.vapic_id);
@@ -533,13 +550,23 @@ impl VirtualApicRegs {
         {
             debug!("[VLAPIC] Invalid ICR value {vec:#010X}");
         } else {
-            debug!(
-                "icrlow {:#010X} icrhi {:#010X} triggered ipi {:#010X}",
+            let dmask = self.calculate_dest(shorthand, is_broadcast, dest, is_phys, false)?;
+            info!(
+                "[VLAPIC] ICR write: vcpu={} x2apic={} icrlow={:#010X} icrhi={:#010X} \
+                 vec={:#010X} mode={:?} shorthand={:?} dest={:#010X} broadcast={} phys={} \
+                 dmask={:#x}",
+                self.vapic_id,
+                self.is_x2apic_enabled(),
                 icr_low.get(),
                 self.regs().ICR_HI.get(),
-                vec
+                vec,
+                mode,
+                shorthand,
+                dest,
+                is_broadcast,
+                is_phys,
+                dmask
             );
-            let dmask = self.calculate_dest(shorthand, is_broadcast, dest, is_phys, false)?;
 
             // TODO: we need to get the specific vcpu number somehow.
             for i in 0..host::current_vm_vcpu_num() as u32 {

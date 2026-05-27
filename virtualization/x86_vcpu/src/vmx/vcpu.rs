@@ -17,6 +17,7 @@ use core::{
     arch::naked_asm,
     fmt::{Debug, Formatter, Result},
     mem::size_of,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use ax_errno::{AxResult, ax_err, ax_err_type};
@@ -35,7 +36,10 @@ use x86::{
     dtables::{self, DescriptorTablePointer},
     segmentation::SegmentSelector,
 };
-use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags, EferFlags};
+use x86_64::{
+    instructions::port::Port as X86Port,
+    registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags, EferFlags},
+};
 use x86_vlapic::EmulatedLocalApic;
 
 use super::{
@@ -43,8 +47,8 @@ use super::{
     definitions::VmxExitReason,
     structs::{IOBitmap, MsrBitmap, VmxRegion},
     vmcs::{
-        self, ApicAccessExitType, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16,
-        VmcsGuest32, VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW,
+        self, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32, VmcsGuest64,
+        ApicAccessExitType, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW,
         VmcsReadOnly32, VmcsReadOnly64, VmcsReadOnlyNW,
     },
 };
@@ -70,6 +74,8 @@ const X86_LOCAL_APIC_SIZE: usize = 0x1000;
 const X86_LOCAL_APIC_EOI_OFFSET: usize = 0xb0;
 const X86_IOAPIC_BASE: usize = 0xfec0_0000;
 const X86_IOAPIC_SIZE: usize = 0x1000;
+const OVMF_VIRTIO_BLK_IO_BASE: u16 = 0x6000;
+const OVMF_VIRTIO_BLK_IO_SIZE: u16 = 0x80;
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum VmCpuMode {
@@ -120,6 +126,8 @@ pub struct VmxVcpu {
     entry: Option<GuestPhysAddr>,
     /// The EPT root address.
     ept_root: Option<HostPhysAddr>,
+    /// Guest-visible vCPU/APIC ID.
+    vcpu_id: VCpuId,
     // /// Whether this VCPU is a host VCpu. Used in type 1.5 hypervisor.
     // is_host: bool, temporary removed because we don't care about type 1.5 now
 
@@ -162,6 +170,7 @@ impl VmxVcpu {
             launched: false,
             entry: None,
             ept_root: None,
+            vcpu_id,
             // is_host: false,
             vmcs: VmxRegion::new(vmcs_revision_id, false)?,
             io_bitmap: IOBitmap::passthrough_all()?,
@@ -176,6 +185,51 @@ impl VmxVcpu {
         };
         info!("[HV] created VmxVcpu(vmcs: {:#x})", vcpu.vmcs.phys_addr());
         Ok(vcpu)
+    }
+
+    fn handle_ovmf_virtio_blk_io_passthrough(
+        &mut self,
+        port: u16,
+        width: AccessWidth,
+        is_in: bool,
+        data: u64,
+    ) -> Option<AxVCpuExitReason> {
+        if !(OVMF_VIRTIO_BLK_IO_BASE..OVMF_VIRTIO_BLK_IO_BASE + OVMF_VIRTIO_BLK_IO_SIZE)
+            .contains(&port)
+        {
+            return None;
+        }
+
+        if is_in {
+            let value = unsafe {
+                match width {
+                    AccessWidth::Byte => X86Port::<u8>::new(port).read() as u64,
+                    AccessWidth::Word => X86Port::<u16>::new(port).read() as u64,
+                    AccessWidth::Dword => X86Port::<u32>::new(port).read() as u64,
+                    AccessWidth::Qword => {
+                        warn!("[OVMF-VIRTIO-BLK-IO] unsupported qword in port {port:#x}");
+                        return Some(AxVCpuExitReason::Halt);
+                    }
+                }
+            };
+            self.regs_mut().rax.set_bits(width.bits_range(), value);
+            info!("[OVMF-VIRTIO-BLK-IO] in port={port:#x} width={width:?} value={value:#x}");
+        } else {
+            unsafe {
+                match width {
+                    AccessWidth::Byte => X86Port::<u8>::new(port).write(data as u8),
+                    AccessWidth::Word => X86Port::<u16>::new(port).write(data as u16),
+                    AccessWidth::Dword => X86Port::<u32>::new(port).write(data as u32),
+                    AccessWidth::Qword => {
+                        warn!("[OVMF-VIRTIO-BLK-IO] unsupported qword out port {port:#x}");
+                        return Some(AxVCpuExitReason::Halt);
+                    }
+                }
+            }
+            info!("[OVMF-VIRTIO-BLK-IO] out port={port:#x} width={width:?} value={data:#x}");
+        }
+
+        Some(AxVCpuExitReason::Nothing)
     }
 
     /// Set the new [`VmxVcpu`] context from guest OS.
@@ -496,6 +550,11 @@ impl VmxVcpu {
         self.io_bitmap.set_intercept_of_range(0x402, 1, true);
         self.io_bitmap.set_intercept_of_range(0x510, 2, true);
         self.io_bitmap.set_intercept_of_range(0x514, 8, true);
+        self.io_bitmap.set_intercept_of_range(
+            OVMF_VIRTIO_BLK_IO_BASE as u32,
+            OVMF_VIRTIO_BLK_IO_SIZE as u32,
+            true,
+        );
         Ok(())
     }
 
@@ -505,6 +564,7 @@ impl VmxVcpu {
         const IA32_APIC_BASE: u32 = 0x1b;
         self.msr_bitmap.set_read_intercept(IA32_APIC_BASE, true);
         self.msr_bitmap.set_write_intercept(IA32_APIC_BASE, true);
+        info!("[VMX] MSR bitmap intercept enabled: IA32_APIC_BASE(0x1b) read/write");
 
         // This is strange, guest Linux's access to `IA32_UMWAIT_CONTROL` will cause an exception.
         // But if we intercept it, it seems okay.
@@ -523,6 +583,7 @@ impl VmxVcpu {
             self.msr_bitmap.set_read_intercept(msr, true);
             self.msr_bitmap.set_write_intercept(msr, true);
         }
+        info!("[VMX] MSR bitmap intercept enabled: x2APIC MSRs 0x800..=0x83f read/write");
         Ok(())
     }
 
@@ -693,6 +754,7 @@ impl VmxVcpu {
         let mut val = CpuCtrl2::ENABLE_EPT | CpuCtrl2::UNRESTRICTED_GUEST;
         for feature in [
             CpuCtrl2::VIRTUALIZE_APIC,
+            CpuCtrl2::VIRTUALIZE_APIC_REGISTER,
             CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY,
         ] {
             if secondary_control_bits_allowed(feature.bits()) {
@@ -779,7 +841,6 @@ impl VmxVcpu {
         VmcsControl64::IO_BITMAP_A_ADDR.write(self.io_bitmap.phys_addr().0.as_usize() as _)?;
         VmcsControl64::IO_BITMAP_B_ADDR.write(self.io_bitmap.phys_addr().1.as_usize() as _)?;
         VmcsControl64::MSR_BITMAPS_ADDR.write(self.msr_bitmap.phys_addr().as_usize() as _)?;
-
         VmcsControl64::VIRT_APIC_ADDR.write(self.vlapic.virtual_apic_page_addr().as_usize() as _)?;
         VmcsControl64::APIC_ACCESS_ADDR
             .write(EmulatedLocalApic::virtual_apic_access_addr().as_usize() as _)?;
@@ -1100,6 +1161,10 @@ impl VmxVcpu {
 
     fn handle_apic_access(&mut self, exit_info: &VmxExitInfo) -> AxResult<AxVCpuExitReason> {
         let apic_access_exit_info = self.apic_access_exit_info()?;
+        warn!(
+            "[VMX] APIC_ACCESS exit: rip={:#x} len={} info={:?}",
+            exit_info.guest_rip, exit_info.exit_instruction_length, apic_access_exit_info
+        );
 
         let write = match apic_access_exit_info.access_type {
             ApicAccessExitType::LinearDataWrite => true,
@@ -1451,7 +1516,9 @@ impl VmxVcpu {
         const VM_EXIT_INSTR_LEN_CPUID: u8 = 2;
         const LEAF_FEATURE_INFO: u32 = 0x1;
         const LEAF_STRUCTURED_EXTENDED_FEATURE_FLAGS_ENUMERATION: u32 = 0x7;
+        const LEAF_EXTENDED_TOPOLOGY: u32 = 0xb;
         const LEAF_PROCESSOR_EXTENDED_STATE_ENUMERATION: u32 = 0xd;
+        const LEAF_V2_EXTENDED_TOPOLOGY: u32 = 0x1f;
         const EAX_FREQUENCY_INFO: u32 = 0x16;
         const LEAF_HYPERVISOR_INFO: u32 = 0x4000_0000;
         const LEAF_HYPERVISOR_FEATURE: u32 = 0x4000_0001;
@@ -1470,7 +1537,14 @@ impl VmxVcpu {
                 const FEATURE_APIC: u32 = 1 << 9;
                 const MAX_LOGICAL_PROCESSORS_MASK: u32 = 0xff << 16;
                 const INITIAL_APIC_ID_MASK: u32 = 0xff << 24;
+                static LOGGED_LEAF1: AtomicBool = AtomicBool::new(false);
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                let host_ecx = res.ecx;
+                let host_ebx = res.ebx;
+                let host_edx = res.edx;
+                let apic_id = (self.vcpu_id as u32) & 0xff;
+                let logical_processor_count =
+                    (host::current_vm_vcpu_num() as u32).clamp(1, 0xff);
                 res.ecx &= !FEATURE_VMX;
                 res.ecx |= FEATURE_X2APIC;
                 res.ecx &= !FEATURE_TSC_DEADLINE;
@@ -1478,15 +1552,70 @@ impl VmxVcpu {
                 res.edx &= !FEATURE_MCE;
                 res.edx |= FEATURE_APIC;
                 res.ebx &= !(MAX_LOGICAL_PROCESSORS_MASK | INITIAL_APIC_ID_MASK);
-                res.ebx |= 1 << 16;
+                res.ebx |= apic_id << 24;
+                res.ebx |= logical_processor_count << 16;
+                if !LOGGED_LEAF1.swap(true, Ordering::Relaxed) {
+                    info!(
+                        "[VMX] CPUID leaf=0x1: host_ebx={:#x} guest_ebx={:#x} host_ecx={:#x} \
+                         guest_ecx={:#x} host_edx={:#x} guest_edx={:#x} apic_id={} \
+                         logical_cpus={} x2apic_exposed={}",
+                        host_ebx,
+                        res.ebx,
+                        host_ecx,
+                        res.ecx,
+                        host_edx,
+                        res.edx,
+                        apic_id,
+                        logical_processor_count,
+                        res.ecx & FEATURE_X2APIC != 0
+                    );
+                }
                 res
             }
-            0xb | 0x1f => CpuIdResult {
-                eax: 0,
-                ebx: 0,
-                ecx: regs_clone.rcx as u32,
-                edx: 0,
-            },
+            LEAF_EXTENDED_TOPOLOGY | LEAF_V2_EXTENDED_TOPOLOGY => {
+                let apic_id = self.vcpu_id as u32;
+                let logical_processor_count =
+                    (host::current_vm_vcpu_num() as u32).clamp(1, u32::from(u16::MAX));
+                let res = match regs_clone.rcx {
+                    0 => CpuIdResult {
+                        eax: 0,
+                        ebx: 1,
+                        ecx: 1 << 8,
+                        edx: apic_id,
+                    },
+                    1 => CpuIdResult {
+                        eax: 0,
+                        ebx: logical_processor_count,
+                        ecx: 2 << 8 | 1,
+                        edx: apic_id,
+                    },
+                    2 if function == LEAF_V2_EXTENDED_TOPOLOGY => CpuIdResult {
+                        eax: 0,
+                        ebx: logical_processor_count,
+                        ecx: 5 << 8 | 2,
+                        edx: apic_id,
+                    },
+                    _ => CpuIdResult {
+                        eax: 0,
+                        ebx: 0,
+                        ecx: regs_clone.rcx as u32,
+                        edx: apic_id,
+                    },
+                };
+                info!(
+                    "[VMX] CPUID topology leaf={:#x} subleaf={} => eax={:#x} ebx={:#x} ecx={:#x} \
+                     edx={:#x} apic_id={} logical_cpus={}",
+                    function,
+                    regs_clone.rcx,
+                    res.eax,
+                    res.ebx,
+                    res.ecx,
+                    res.edx,
+                    apic_id,
+                    logical_processor_count
+                );
+                res
+            }
             // See SDM Table 3-8. Information Returned by CPUID Instruction (Contd.)
             LEAF_STRUCTURED_EXTENDED_FEATURE_FLAGS_ENUMERATION => {
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
@@ -1614,12 +1743,15 @@ impl VmxVcpu {
             exception_vector_name(intr_info.vector)
         );
         warn!(
-            "VMX exception raw fields: intr_info={raw_intr_info:#x}, idt_info={raw_idt_info:#x}, idt_err={raw_idt_err:#x}, qualification={exit_qualification:#x}, gla={guest_linear_addr:#x}, gpa={guest_physical_addr:#x}"
+            "VMX exception raw fields: intr_info={raw_intr_info:#x}, idt_info={raw_idt_info:#x}, \
+             idt_err={raw_idt_err:#x}, qualification={exit_qualification:#x}, \
+             gla={guest_linear_addr:#x}, gpa={guest_physical_addr:#x}"
         );
         dump_interruption_error_code("VMX exception", intr_info.vector, intr_info.err_code);
         dump_idt_vectoring_info("VMX exception", raw_idt_info, raw_idt_err);
         warn!(
-            "VMX guest state: rip={:#x}, rsp={:#x}, rflags={:#x}, cr0={:#x}, cr3={:#x}, cr4={:#x}, efer={:#x}",
+            "VMX guest state: rip={:#x}, rsp={:#x}, rflags={:#x}, cr0={:#x}, cr3={:#x}, \
+             cr4={:#x}, efer={:#x}",
             VmcsGuestNW::RIP.read()?,
             VmcsGuestNW::RSP.read()?,
             VmcsGuestNW::RFLAGS.read()?,
@@ -1645,11 +1777,15 @@ impl VmxVcpu {
 
         warn!("VMX triple fault VM-Exit: {exit_info:#x?}");
         warn!(
-            "VMX triple fault raw fields: intr_info={raw_intr_info:#x}, idt_info={raw_idt_info:#x}, idt_err={raw_idt_err:#x}, qualification={exit_qualification:#x}, gla={guest_linear_addr:#x}, gpa={guest_physical_addr:#x}"
+            "VMX triple fault raw fields: intr_info={raw_intr_info:#x}, \
+             idt_info={raw_idt_info:#x}, idt_err={raw_idt_err:#x}, \
+             qualification={exit_qualification:#x}, gla={guest_linear_addr:#x}, \
+             gpa={guest_physical_addr:#x}"
         );
         dump_idt_vectoring_info("VMX triple fault", raw_idt_info, raw_idt_err);
         warn!(
-            "VMX triple fault guest state: rip={:#x}, rsp={:#x}, rflags={:#x}, cr0={:#x}, cr3={:#x}, cr4={:#x}, efer={:#x}",
+            "VMX triple fault guest state: rip={:#x}, rsp={:#x}, rflags={:#x}, cr0={:#x}, \
+             cr3={:#x}, cr4={:#x}, efer={:#x}",
             VmcsGuestNW::RIP.read()?,
             VmcsGuestNW::RSP.read()?,
             VmcsGuestNW::RFLAGS.read()?,
@@ -1678,7 +1814,10 @@ impl VmxVcpu {
 
     fn dump_guest_segments(&self, prefix: &str) -> AxResult {
         warn!(
-            "{prefix} guest segments: cs={:#x} base={:#x} limit={:#x} ar={:#x}, ss={:#x} base={:#x} limit={:#x} ar={:#x}, ds={:#x} base={:#x} limit={:#x} ar={:#x}, es={:#x} base={:#x} limit={:#x} ar={:#x}, fs={:#x} base={:#x} limit={:#x} ar={:#x}, gs={:#x} base={:#x} limit={:#x} ar={:#x}, tr={:#x} base={:#x} limit={:#x} ar={:#x}",
+            "{prefix} guest segments: cs={:#x} base={:#x} limit={:#x} ar={:#x}, ss={:#x} \
+             base={:#x} limit={:#x} ar={:#x}, ds={:#x} base={:#x} limit={:#x} ar={:#x}, es={:#x} \
+             base={:#x} limit={:#x} ar={:#x}, fs={:#x} base={:#x} limit={:#x} ar={:#x}, gs={:#x} \
+             base={:#x} limit={:#x} ar={:#x}, tr={:#x} base={:#x} limit={:#x} ar={:#x}",
             VmcsGuest16::CS_SELECTOR.read()?,
             VmcsGuestNW::CS_BASE.read()?,
             VmcsGuest32::CS_LIMIT.read()?,
@@ -1769,14 +1908,16 @@ fn dump_interruption_error_code(prefix: &str, vector: u8, err_code: Option<u32>)
                 _ => "unknown",
             };
             warn!(
-                "{prefix} exception error code decode: raw={err_code:#x}, selector={selector:#x}, index={:#x}, table={}, external={}",
+                "{prefix} exception error code decode: raw={err_code:#x}, selector={selector:#x}, \
+                 index={:#x}, table={}, external={}",
                 selector >> 3,
                 table,
                 external,
             );
         }
         14 => warn!(
-            "{prefix} page-fault error code decode: raw={err_code:#x}, present={}, write={}, user={}, reserved={}, instruction_fetch={}",
+            "{prefix} page-fault error code decode: raw={err_code:#x}, present={}, write={}, \
+             user={}, reserved={}, instruction_fetch={}",
             err_code.get_bit(0),
             err_code.get_bit(1),
             err_code.get_bit(2),
@@ -1807,7 +1948,8 @@ fn dump_idt_vectoring_info(prefix: &str, raw_idt_info: u32, idt_err: u32) {
     };
     let has_error_code = raw_idt_info.get_bit(11);
     warn!(
-        "{prefix} IDT-vectoring decode: vector={vector:#x} {}, type={interruption_type:#x} ({interruption_type_name}), has_error_code={}, err={idt_err:#x}",
+        "{prefix} IDT-vectoring decode: vector={vector:#x} {}, type={interruption_type:#x} \
+         ({interruption_type_name}), has_error_code={}, err={idt_err:#x}",
         exception_vector_name(vector),
         has_error_code,
     );
@@ -1916,6 +2058,15 @@ impl AxArchVCpu for VmxVcpu {
                                     return Ok(AxVCpuExitReason::Halt);
                                 }
                             };
+
+                            if let Some(exit_reason) = self.handle_ovmf_virtio_blk_io_passthrough(
+                                port,
+                                width,
+                                io_info.is_in,
+                                self.regs().rax.get_bits(width.bits_range()),
+                            ) {
+                                return Ok(exit_reason);
+                            }
 
                             if io_info.is_in {
                                 AxVCpuExitReason::IoRead {

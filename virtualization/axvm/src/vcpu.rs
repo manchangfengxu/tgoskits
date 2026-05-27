@@ -16,6 +16,7 @@
 
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "x86_64")] {
+        pub use x86_vcpu::EmulatedLocalApic;
         pub use x86_vcpu::X86ArchVCpu as AxArchVCpuImpl;
         pub use x86_vcpu::X86ArchPerCpuState as AxVMArchPerCpuImpl;
         pub use x86_vcpu::X86VCpuSetupConfig as AxVCpuSetupConfig;

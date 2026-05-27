@@ -3,6 +3,7 @@ use core::{
     arch::asm,
     fmt::{Debug, Formatter, Result as FmtResult},
     mem::size_of,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use ax_errno::{AxResult, ax_err, ax_err_type};
@@ -194,6 +195,8 @@ pub struct SvmVcpu {
     entry: Option<GuestPhysAddr>,
     /// The nested page table root address.
     npt_root: Option<HostPhysAddr>,
+    /// Guest-visible vCPU/APIC ID.
+    vcpu_id: VCpuId,
     /// The guest VMCB.
     vmcb: VmcbFrame,
     /// Host state saved with VMSAVE and restored with VMLOAD.
@@ -220,6 +223,7 @@ impl SvmVcpu {
             launched: false,
             entry: None,
             npt_root: None,
+            vcpu_id,
             vmcb: VmcbFrame::new()?,
             load_save_states: VmLoadSaveStates::new()?,
             iopm: IOPm::passthrough_all()?,
@@ -357,6 +361,7 @@ impl SvmVcpu {
         self.msrpm.set_write_intercept(IA32_UMWAIT_CONTROL, true);
         self.msrpm.set_read_intercept(AMD64_DE_CFG, true);
         self.msrpm.set_write_intercept(AMD64_DE_CFG, true);
+        info!("[SVM] MSR bitmap intercept enabled: IA32_APIC_BASE(0x1b) read/write");
         // Keep MTRR default type under software control so OVMF does not observe
         // host FE state during PEI.
         self.msrpm.set_read_intercept(IA32_MTRR_DEF_TYPE, true);
@@ -366,6 +371,7 @@ impl SvmVcpu {
             self.msrpm.set_read_intercept(msr, true);
             self.msrpm.set_write_intercept(msr, true);
         }
+        info!("[SVM] MSR bitmap intercept enabled: x2APIC MSRs 0x800..=0x83f read/write");
         Ok(())
     }
 
@@ -645,9 +651,17 @@ impl SvmVcpu {
         const VM_EXIT_INSTR_LEN_MSR: u8 = 2;
 
         if exit_info.exit_info_1 == 0 {
-            self.write_edx_eax(self.vlapic.apic_base());
+            let value = self.vlapic.apic_base();
+            info!("[SVM] IA32_APIC_BASE read intercepted: value={value:#x}");
+            self.write_edx_eax(value);
         } else {
-            self.vlapic.set_apic_base(self.read_edx_eax())?;
+            let value = self.read_edx_eax();
+            info!("[SVM] IA32_APIC_BASE write intercepted: value={value:#x}");
+            self.vlapic.set_apic_base(value)?;
+            info!(
+                "[SVM] IA32_APIC_BASE shadow after write: value={:#x}",
+                self.vlapic.apic_base()
+            );
         }
         self.advance_rip(VM_EXIT_INSTR_LEN_MSR)
     }
@@ -731,7 +745,9 @@ impl SvmVcpu {
         const VM_EXIT_INSTR_LEN_CPUID: u8 = 2;
         const LEAF_FEATURE_INFO: u32 = 0x1;
         const LEAF_STRUCTURED_EXTENDED_FEATURE_FLAGS_ENUMERATION: u32 = 0x7;
+        const LEAF_EXTENDED_TOPOLOGY: u32 = 0xb;
         const LEAF_PROCESSOR_EXTENDED_STATE_ENUMERATION: u32 = 0xd;
+        const LEAF_V2_EXTENDED_TOPOLOGY: u32 = 0x1f;
         const LEAF_EXTENDED_FEATURE_INFO: u32 = 0x8000_0001;
         const LEAF_SVM_FEATURES: u32 = 0x8000_000a;
         const EAX_FREQUENCY_INFO: u32 = 0x16;
@@ -757,7 +773,14 @@ impl SvmVcpu {
                 const FEATURE_APIC: u32 = 1 << 9;
                 const MAX_LOGICAL_PROCESSORS_MASK: u32 = 0xff << 16;
                 const INITIAL_APIC_ID_MASK: u32 = 0xff << 24;
+                static LOGGED_LEAF1: AtomicBool = AtomicBool::new(false);
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                let host_ecx = res.ecx;
+                let host_ebx = res.ebx;
+                let host_edx = res.edx;
+                let apic_id = (self.vcpu_id as u32) & 0xff;
+                let logical_processor_count =
+                    (host::current_vm_vcpu_num() as u32).clamp(1, 0xff);
                 // Do not expose nested hardware virtualization to the guest.
                 res.ecx &= !FEATURE_VMX;
                 res.ecx &= !FEATURE_PCID;
@@ -767,15 +790,70 @@ impl SvmVcpu {
                 res.edx &= !FEATURE_MCE;
                 res.edx |= FEATURE_APIC;
                 res.ebx &= !(MAX_LOGICAL_PROCESSORS_MASK | INITIAL_APIC_ID_MASK);
-                res.ebx |= 1 << 16;
+                res.ebx |= apic_id << 24;
+                res.ebx |= logical_processor_count << 16;
+                if !LOGGED_LEAF1.swap(true, Ordering::Relaxed) {
+                    info!(
+                        "[SVM] CPUID leaf=0x1: host_ebx={:#x} guest_ebx={:#x} host_ecx={:#x} \
+                         guest_ecx={:#x} host_edx={:#x} guest_edx={:#x} apic_id={} \
+                         logical_cpus={} x2apic_exposed={}",
+                        host_ebx,
+                        res.ebx,
+                        host_ecx,
+                        res.ecx,
+                        host_edx,
+                        res.edx,
+                        apic_id,
+                        logical_processor_count,
+                        res.ecx & FEATURE_X2APIC != 0
+                    );
+                }
                 res
             }
-            0xb | 0x1f => CpuIdResult {
-                eax: 0,
-                ebx: 0,
-                ecx: regs_clone.rcx as u32,
-                edx: 0,
-            },
+            LEAF_EXTENDED_TOPOLOGY | LEAF_V2_EXTENDED_TOPOLOGY => {
+                let apic_id = self.vcpu_id as u32;
+                let logical_processor_count =
+                    (host::current_vm_vcpu_num() as u32).clamp(1, u32::from(u16::MAX));
+                let res = match regs_clone.rcx {
+                    0 => CpuIdResult {
+                        eax: 0,
+                        ebx: 1,
+                        ecx: 1 << 8,
+                        edx: apic_id,
+                    },
+                    1 => CpuIdResult {
+                        eax: 0,
+                        ebx: logical_processor_count,
+                        ecx: 2 << 8 | 1,
+                        edx: apic_id,
+                    },
+                    2 if function == LEAF_V2_EXTENDED_TOPOLOGY => CpuIdResult {
+                        eax: 0,
+                        ebx: logical_processor_count,
+                        ecx: 5 << 8 | 2,
+                        edx: apic_id,
+                    },
+                    _ => CpuIdResult {
+                        eax: 0,
+                        ebx: 0,
+                        ecx: regs_clone.rcx as u32,
+                        edx: apic_id,
+                    },
+                };
+                info!(
+                    "[SVM] CPUID topology leaf={:#x} subleaf={} => eax={:#x} ebx={:#x} ecx={:#x} \
+                     edx={:#x} apic_id={} logical_cpus={}",
+                    function,
+                    regs_clone.rcx,
+                    res.eax,
+                    res.ebx,
+                    res.ecx,
+                    res.edx,
+                    apic_id,
+                    logical_processor_count
+                );
+                res
+            }
             LEAF_STRUCTURED_EXTENDED_FEATURE_FLAGS_ENUMERATION => {
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
                 if regs_clone.rcx == 0 {

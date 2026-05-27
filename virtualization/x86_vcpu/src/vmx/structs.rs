@@ -98,7 +98,7 @@ impl IOBitmap {
             (port - 0x8000, &mut self.io_bitmap_b_frame)
         };
         let bitmap =
-            unsafe { core::slice::from_raw_parts_mut(io_bit_map_frame.as_mut_ptr(), 1024) };
+            unsafe { core::slice::from_raw_parts_mut(io_bit_map_frame.as_mut_ptr(), 4096) };
         let byte = (port / 8) as usize;
         let bits = port % 8;
         if intercept {
