@@ -1267,6 +1267,10 @@ name = "ax-timer-list"
 version = "0.3.5"
 
 [[package]]
+name = "ax-uefi-helloworld"
+version = "0.1.0"
+
+[[package]]
 name = "ax_slab_allocator"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1627,6 +1631,7 @@ dependencies = [
  "riscv_vcpu",
  "riscv_vplic",
  "spin 0.12.0",
+ "x86_64",
  "x86_vcpu",
  "x86_vlapic",
 ]

@@ -1,0 +1,12 @@
+[package]
+name = "ax-uefi-helloworld"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+edition.workspace = true
+authors = ["The Axvisor Team"]
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ax-uefi-helloworld"
+path = "src/main.rs"

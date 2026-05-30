@@ -87,6 +87,7 @@ members = [
     "os/StarryOS/kernel",
     "os/StarryOS/starryos",
     "os/arceos/api/*",
+    "os/arceos/examples/uefi-helloworld",
     "os/arceos/modules/axalloc",
     "os/arceos/modules/axconfig",
     "os/arceos/modules/axdisplay",
@@ -156,6 +157,7 @@ ax-fs-vfs = { version = "0.3.11", path = "components/axfs_crates/axfs_vfs" }
 ax-hal = { version = "0.5.18", path = "os/arceos/modules/axhal" }
 ax-handler-table = { version = "0.3.7", path = "components/handler_table" }
 irq-framework = { version = "0.1.0", path = "components/irq-framework" }
+ax-uefi-helloworld = { version = "0.1.0", path = "os/arceos/examples/uefi-helloworld" }
 ax-input = { version = "0.5.17", path = "os/arceos/modules/axinput" }
 ax-int-ratio = { version = "0.3.7", path = "components/int_ratio" }
 ax-io = { version = "0.6.0", path = "components/axio" }
@@ -280,7 +282,7 @@ ranges-ext = { version = "0.6.4", path = "memory/ranges-ext" }
 somehal-macros = { path = "components/somehal-macros", version = "0.1.3" }
 kasm-aarch64 = { path = "components/kasm-aarch64", version = "0.2.1" }
 somehal = { version = "0.6.10", path = "platforms/somehal" }
-
+x86_64 = "0.15"
 # External crates
 anyhow = { version = "1.0", default-features = false }
 bincode = "2.0.1"

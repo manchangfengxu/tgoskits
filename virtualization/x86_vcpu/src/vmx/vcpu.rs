@@ -36,10 +36,7 @@ use x86::{
     dtables::{self, DescriptorTablePointer},
     segmentation::SegmentSelector,
 };
-use x86_64::{
-    instructions::port::Port as X86Port,
-    registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags, EferFlags},
-};
+use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags, EferFlags};
 use x86_vlapic::EmulatedLocalApic;
 
 use super::{
@@ -185,51 +182,6 @@ impl VmxVcpu {
         };
         info!("[HV] created VmxVcpu(vmcs: {:#x})", vcpu.vmcs.phys_addr());
         Ok(vcpu)
-    }
-
-    fn handle_ovmf_virtio_blk_io_passthrough(
-        &mut self,
-        port: u16,
-        width: AccessWidth,
-        is_in: bool,
-        data: u64,
-    ) -> Option<AxVCpuExitReason> {
-        if !(OVMF_VIRTIO_BLK_IO_BASE..OVMF_VIRTIO_BLK_IO_BASE + OVMF_VIRTIO_BLK_IO_SIZE)
-            .contains(&port)
-        {
-            return None;
-        }
-
-        if is_in {
-            let value = unsafe {
-                match width {
-                    AccessWidth::Byte => X86Port::<u8>::new(port).read() as u64,
-                    AccessWidth::Word => X86Port::<u16>::new(port).read() as u64,
-                    AccessWidth::Dword => X86Port::<u32>::new(port).read() as u64,
-                    AccessWidth::Qword => {
-                        warn!("[OVMF-VIRTIO-BLK-IO] unsupported qword in port {port:#x}");
-                        return Some(AxVCpuExitReason::Halt);
-                    }
-                }
-            };
-            self.regs_mut().rax.set_bits(width.bits_range(), value);
-            info!("[OVMF-VIRTIO-BLK-IO] in port={port:#x} width={width:?} value={value:#x}");
-        } else {
-            unsafe {
-                match width {
-                    AccessWidth::Byte => X86Port::<u8>::new(port).write(data as u8),
-                    AccessWidth::Word => X86Port::<u16>::new(port).write(data as u16),
-                    AccessWidth::Dword => X86Port::<u32>::new(port).write(data as u32),
-                    AccessWidth::Qword => {
-                        warn!("[OVMF-VIRTIO-BLK-IO] unsupported qword out port {port:#x}");
-                        return Some(AxVCpuExitReason::Halt);
-                    }
-                }
-            }
-            info!("[OVMF-VIRTIO-BLK-IO] out port={port:#x} width={width:?} value={data:#x}");
-        }
-
-        Some(AxVCpuExitReason::Nothing)
     }
 
     /// Set the new [`VmxVcpu`] context from guest OS.
@@ -2059,13 +2011,22 @@ impl AxArchVCpu for VmxVcpu {
                                 }
                             };
 
-                            if let Some(exit_reason) = self.handle_ovmf_virtio_blk_io_passthrough(
-                                port,
-                                width,
-                                io_info.is_in,
-                                self.regs().rax.get_bits(width.bits_range()),
-                            ) {
-                                return Ok(exit_reason);
+                            if (OVMF_VIRTIO_BLK_IO_BASE
+                                ..OVMF_VIRTIO_BLK_IO_BASE + OVMF_VIRTIO_BLK_IO_SIZE)
+                                .contains(&port)
+                            {
+                                return Ok(if io_info.is_in {
+                                    AxVCpuExitReason::IoRead {
+                                        port: Port(port),
+                                        width,
+                                    }
+                                } else {
+                                    AxVCpuExitReason::IoWrite {
+                                        port: Port(port),
+                                        width,
+                                        data: self.regs().rax.get_bits(width.bits_range()),
+                                    }
+                                });
                             }
 
                             if io_info.is_in {

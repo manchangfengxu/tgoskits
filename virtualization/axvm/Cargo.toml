@@ -57,6 +57,7 @@ axdevice_base = { workspace = true }
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_vcpu = { workspace = true }
 x86_vlapic = { workspace = true }
+x86_64 = { workspace = true }
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 axplat-dyn = { workspace = true, optional = true, default-features = false }
 riscv_vcpu = { workspace = true }

@@ -23,12 +23,17 @@ use axaddrspace::{AddrSpace, MappingFlags};
 use axdevice::{AxVmDeviceConfig, AxVmDevices};
 use axdevice_base::{AccessWidth, Port};
 use axvcpu::{AxVCpu, AxVCpuExitReason};
+
 #[cfg(target_arch = "x86_64")]
 use axvm_types::EmulatedDeviceType;
 use axvm_types::{GuestPhysAddr, HostPhysAddr, HostVirtAddr};
 use spin::Once;
+
 #[cfg(all(target_arch = "x86_64", feature = "vmx"))]
 use x86_vcpu::{X86_APIC_ACCESS_GPA, x86_apic_access_page_addr};
+
+#[cfg(target_arch = "x86_64")]
+use x86_64::instructions::port::Port as X86Port;
 
 #[cfg(not(target_arch = "x86_64"))]
 use crate::vcpu::AxVCpuCreateConfig;
@@ -73,6 +78,18 @@ const FW_CFG_DMA_CTL_SKIP: u32 = 1 << 2;
 const FW_CFG_DMA_CTL_SELECT: u32 = 1 << 3;
 #[cfg(target_arch = "x86_64")]
 const FW_CFG_DMA_CTL_WRITE: u32 = 1 << 4;
+#[cfg(target_arch = "x86_64")]
+const OVMF_VIRTIO_BLK_IO_BASE: u16 = 0x6000;
+#[cfg(target_arch = "x86_64")]
+const OVMF_VIRTIO_BLK_IO_SIZE: u16 = 0x80;
+#[cfg(target_arch = "x86_64")]
+const OVMF_VIRTIO_BLK_QUEUE_PFN: u16 = OVMF_VIRTIO_BLK_IO_BASE + 0x08;
+#[cfg(target_arch = "x86_64")]
+const OVMF_VIRTIO_BLK_QUEUE_NOTIFY: u16 = OVMF_VIRTIO_BLK_IO_BASE + 0x10;
+#[cfg(target_arch = "x86_64")]
+const ACPI_PM_IO_BASE: u16 = 0x600;
+#[cfg(target_arch = "x86_64")]
+const ACPI_PM_IO_SIZE: u16 = 0x10;
 
 /// A vCPU with architecture-independent interface.
 type VCpu = AxVCpu<AxArchVCpuImpl>;
@@ -138,6 +155,14 @@ impl VMMemoryRegion {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Default)]
+struct OvmfVirtioBlkIoState {
+    queue_pfn: u32,
+    queue_size: u16,
+    translated_queue_pfn: u32,
+}
+
 struct AxVMInnerMut {
     // Todo: use more efficient lock.
     address_space: AddrSpace<HostPagingHandler>,
@@ -146,6 +171,8 @@ struct AxVMInnerMut {
     vm_status: VMStatus,
     #[cfg(target_arch = "x86_64")]
     fw_cfg: FwCfgState,
+    #[cfg(target_arch = "x86_64")]
+    ovmf_virtio_blk: OvmfVirtioBlkIoState,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -354,6 +381,8 @@ impl AxVM {
                 vm_status: VMStatus::Loading,
                 #[cfg(target_arch = "x86_64")]
                 fw_cfg: FwCfgState::new(),
+                #[cfg(target_arch = "x86_64")]
+                ovmf_virtio_blk: OvmfVirtioBlkIoState::default(),
             }),
         });
 
@@ -784,16 +813,26 @@ impl AxVM {
                             .handle_mmio_write(addr, width, data as usize)?;
                     }
                     AxVCpuExitReason::IoRead { port, width } => {
-                        #[cfg(target_arch = "x86_64")]
-                        let val = if let Some(val) = self.handle_fw_cfg_io_read(port, width)? {
-                            val
-                        } else {
+                        let val = {
+                            #[cfg(target_arch = "x86_64")]
+                            if let Some(val) = self.handle_fw_cfg_io_read(port, width)? {
+                                val
+                            } else if let Some(val) =
+                                self.handle_ovmf_virtio_blk_io_read(port, width)?
+                            {
+                                val
+                            } else if let Some(val) = self.handle_acpi_pm_io_read(port, width)? {
+                                val
+                            } else {
+                                self.get_devices().handle_port_read(port, width)?
+                            }
+
+                            #[cfg(not(target_arch = "x86_64"))]
                             self.get_devices().handle_port_read(port, width)?
                         };
-                        #[cfg(not(target_arch = "x86_64"))]
-                        let val = self.get_devices().handle_port_read(port, width)?;
+
                         #[cfg(not(target_arch = "riscv64"))]
-                        vcpu.set_gpr(0, val); // The target is always eax/ax/al, todo: handle access_width correctly
+                        vcpu.set_gpr(0, val); // Target is always eax/ax/al
 
                         #[cfg(target_arch = "riscv64")]
                         vcpu.set_gpr(riscv_vcpu::GprIndex::A0 as usize, val);
@@ -801,26 +840,23 @@ impl AxVM {
                     AxVCpuExitReason::IoWrite { port, width, data } => {
                         #[cfg(target_arch = "x86_64")]
                         if self.handle_fw_cfg_io_write(port, width, data as usize)? {
-                            continue;
+                            // 成功由 fw_cfg 处理
+                        } else if self.handle_ovmf_virtio_blk_io_write(
+                            port,
+                            width,
+                            data as usize,
+                        )? {
+                            // 成功由 ovmf_virtio_blk 处理
+                        } else if self.handle_acpi_pm_io_write(port, width, data as usize)? {
+                            // 成功由 acpi_pm 处理
+                        } else {
+                            self.get_devices()
+                                .handle_port_write(port, width, data as usize)?;
                         }
+
+                        #[cfg(not(target_arch = "x86_64"))]
                         self.get_devices()
                             .handle_port_write(port, width, data as usize)?;
-                    }
-                    AxVCpuExitReason::SysRegRead { addr, reg } => {
-                        let val = self.get_devices().handle_sys_reg_read(
-                            addr,
-                            // Generally speaking, the width of system register is fixed and needless to be specified.
-                            // AccessWidth::Qword here is just a placeholder, may be changed in the future.
-                            AccessWidth::Qword,
-                        )?;
-                        vcpu.set_gpr(reg, val);
-                    }
-                    AxVCpuExitReason::SysRegWrite { addr, value } => {
-                        self.get_devices().handle_sys_reg_write(
-                            addr,
-                            AccessWidth::Qword,
-                            value as usize,
-                        )?;
                     }
                     AxVCpuExitReason::NestedPageFault { addr, access_flags } => {
                         if !self.handle_nested_page_fault(addr, access_flags) {
@@ -1177,7 +1213,279 @@ impl AxVM {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn handle_fw_cfg_io_read(&self, port: Port, width: AccessWidth) -> AxResult<Option<usize>> {
+    fn handle_ovmf_virtio_blk_io_read(
+        &self,
+        port: Port,
+        width: AccessWidth,
+    ) -> AxResult<Option<usize>> {
+        if !(OVMF_VIRTIO_BLK_IO_BASE..OVMF_VIRTIO_BLK_IO_BASE + OVMF_VIRTIO_BLK_IO_SIZE)
+            .contains(&port.number())
+        {
+            return Ok(None);
+        }
+
+        let value = unsafe {
+            match width {
+                AccessWidth::Byte => X86Port::<u8>::new(port.number()).read() as usize,
+                AccessWidth::Word => X86Port::<u16>::new(port.number()).read() as usize,
+                AccessWidth::Dword => X86Port::<u32>::new(port.number()).read() as usize,
+                AccessWidth::Qword => {
+                    return ax_err!(InvalidInput, "unsupported qword virtio-blk I/O read");
+                }
+            }
+        };
+
+        if port.number() == OVMF_VIRTIO_BLK_IO_BASE + 0x0c && width == AccessWidth::Word {
+            self.inner_mut.lock().ovmf_virtio_blk.queue_size = value as u16;
+        }
+
+        info!(
+            "[OVMF-VIRTIO-BLK-IO] in port={:#x} width={width:?} value={value:#x}",
+            port.number()
+        );
+        Ok(Some(value))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn handle_ovmf_virtio_blk_io_write(
+        &self,
+        port: Port,
+        width: AccessWidth,
+        val: usize,
+    ) -> AxResult<bool> {
+        if !(OVMF_VIRTIO_BLK_IO_BASE..OVMF_VIRTIO_BLK_IO_BASE + OVMF_VIRTIO_BLK_IO_SIZE)
+            .contains(&port.number())
+        {
+            return Ok(false);
+        }
+
+        let mut forwarded = val;
+        if port.number() == OVMF_VIRTIO_BLK_QUEUE_PFN && width == AccessWidth::Dword {
+            if let Some(translated_pfn) = self.translate_ovmf_virtio_blk_queue_pfn(val as u32) {
+                forwarded = translated_pfn as usize;
+            }
+        }
+
+        if port.number() == OVMF_VIRTIO_BLK_QUEUE_NOTIFY && width == AccessWidth::Word {
+            self.rewrite_ovmf_virtio_blk_descriptors()?;
+            self.dump_ovmf_virtio_blk_queue("before-notify")?;
+        }
+
+        unsafe {
+            match width {
+                AccessWidth::Byte => X86Port::<u8>::new(port.number()).write(forwarded as u8),
+                AccessWidth::Word => X86Port::<u16>::new(port.number()).write(forwarded as u16),
+                AccessWidth::Dword => X86Port::<u32>::new(port.number()).write(forwarded as u32),
+                AccessWidth::Qword => {
+                    return ax_err!(InvalidInput, "unsupported qword virtio-blk I/O write");
+                }
+            }
+        }
+
+        info!(
+            "[OVMF-VIRTIO-BLK-IO] out port={:#x} width={width:?} value={val:#x} \
+             forwarded={forwarded:#x}",
+            port.number()
+        );
+        Ok(true)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn translate_ovmf_virtio_blk_queue_pfn(&self, queue_pfn: u32) -> Option<u32> {
+        let queue_gpa = GuestPhysAddr::from((queue_pfn as usize) << 12);
+        let mut g = self.inner_mut.lock();
+        let (queue_hpa, limit) = g.address_space.translate_and_get_limit(queue_gpa)?;
+        let translated_pfn = (queue_hpa.as_usize() >> 12) as u32;
+        g.ovmf_virtio_blk.queue_pfn = queue_pfn;
+        g.ovmf_virtio_blk.translated_queue_pfn = translated_pfn;
+        info!(
+            "[OVMF-VIRTIO-BLK] queue_pfn={queue_pfn:#x} queue_gpa={queue_gpa:?} \
+             queue_hpa={queue_hpa:?} limit={limit:#x} translated_pfn={translated_pfn:#x}"
+        );
+        Some(translated_pfn)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn rewrite_ovmf_virtio_blk_descriptors(&self) -> AxResult {
+        let (queue_pfn, queue_size) = {
+            let g = self.inner_mut.lock();
+            (g.ovmf_virtio_blk.queue_pfn, g.ovmf_virtio_blk.queue_size)
+        };
+        if queue_pfn == 0 || queue_size == 0 {
+            return Ok(());
+        }
+
+        let queue_gpa = GuestPhysAddr::from((queue_pfn as usize) << 12);
+        let avail_gpa = GuestPhysAddr::from(queue_gpa.as_usize() + queue_size as usize * 16);
+        let mut avail = [0u8; 6];
+        {
+            let g = self.inner_mut.lock();
+            Self::read_guest_bytes_locked(&g.address_space, avail_gpa, &mut avail)?;
+        }
+        let avail_idx = u16::from_le_bytes(avail[2..4].try_into().unwrap());
+        let ring_slot = avail_idx.wrapping_sub(1) as usize % queue_size as usize;
+        let ring_gpa = GuestPhysAddr::from(avail_gpa.as_usize() + 4 + ring_slot * 2);
+        let mut head_bytes = [0u8; 2];
+        {
+            let g = self.inner_mut.lock();
+            Self::read_guest_bytes_locked(&g.address_space, ring_gpa, &mut head_bytes)?;
+        }
+        let head = u16::from_le_bytes(head_bytes) as usize;
+
+        let mut next = head;
+        for _ in 0..queue_size.min(8) {
+            if next >= queue_size as usize {
+                warn!("[OVMF-VIRTIO-BLK] descriptor index {next} out of queue size {queue_size}");
+                break;
+            }
+
+            let desc_gpa = GuestPhysAddr::from(queue_gpa.as_usize() + next * 16);
+            let mut desc = [0u8; 16];
+            {
+                let g = self.inner_mut.lock();
+                Self::read_guest_bytes_locked(&g.address_space, desc_gpa, &mut desc)?;
+            }
+
+            let addr = u64::from_le_bytes(desc[0..8].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(desc[8..12].try_into().unwrap());
+            let flags = u16::from_le_bytes(desc[12..14].try_into().unwrap());
+            let desc_next = u16::from_le_bytes(desc[14..16].try_into().unwrap()) as usize;
+            let translated = {
+                let g = self.inner_mut.lock();
+                g.address_space
+                    .translate_and_get_limit(GuestPhysAddr::from(addr))
+                    .map(|(hpa, limit)| (hpa.as_usize() as u64, limit))
+            };
+
+            if let Some((translated_addr, limit)) = translated {
+                desc[0..8].copy_from_slice(&translated_addr.to_le_bytes());
+                {
+                    let g = self.inner_mut.lock();
+                    Self::write_guest_bytes_locked(&g.address_space, desc_gpa, &desc)?;
+                }
+                info!(
+                    "[OVMF-VIRTIO-BLK] rewrite desc[{next}] addr={addr:#x}->{translated_addr:#x} \
+                     len={len:#x} flags={flags:#x} next={desc_next} limit={limit:#x}"
+                );
+            } else {
+                warn!(
+                    "[OVMF-VIRTIO-BLK] failed to translate desc[{next}] addr={addr:#x} \
+                     len={len:#x} flags={flags:#x} next={desc_next}"
+                );
+            }
+
+            if flags & 0x1 == 0 {
+                break;
+            }
+            next = desc_next;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn dump_ovmf_virtio_blk_queue(&self, tag: &str) -> AxResult {
+        let (queue_pfn, queue_size, translated_queue_pfn) = {
+            let g = self.inner_mut.lock();
+            (
+                g.ovmf_virtio_blk.queue_pfn,
+                g.ovmf_virtio_blk.queue_size,
+                g.ovmf_virtio_blk.translated_queue_pfn,
+            )
+        };
+        if queue_pfn == 0 || queue_size == 0 {
+            info!(
+                "[OVMF-VIRTIO-BLK] {tag}: queue not configured pfn={queue_pfn:#x} \
+                 size={queue_size}"
+            );
+            return Ok(());
+        }
+
+        let queue_gpa = GuestPhysAddr::from((queue_pfn as usize) << 12);
+        let avail_gpa = GuestPhysAddr::from(queue_gpa.as_usize() + queue_size as usize * 16);
+        let used_gpa = GuestPhysAddr::from(
+            (avail_gpa.as_usize() + 4 + queue_size as usize * 2 + 0xfff) & !0xfff,
+        );
+        let mut avail = [0u8; 6];
+        let mut used = [0u8; 4];
+        {
+            let g = self.inner_mut.lock();
+            Self::read_guest_bytes_locked(&g.address_space, avail_gpa, &mut avail)?;
+            Self::read_guest_bytes_locked(&g.address_space, used_gpa, &mut used)?;
+        }
+        let avail_flags = u16::from_le_bytes(avail[0..2].try_into().unwrap());
+        let avail_idx = u16::from_le_bytes(avail[2..4].try_into().unwrap());
+        let avail_head = u16::from_le_bytes(avail[4..6].try_into().unwrap());
+        let used_flags = u16::from_le_bytes(used[0..2].try_into().unwrap());
+        let used_idx = u16::from_le_bytes(used[2..4].try_into().unwrap());
+        info!(
+            "[OVMF-VIRTIO-BLK] {tag}: queue_pfn={queue_pfn:#x} \
+             translated_queue_pfn={translated_queue_pfn:#x} size={queue_size} \
+             queue_gpa={queue_gpa:?} avail_idx={avail_idx} avail_head={avail_head} \
+             avail_flags={avail_flags:#x} used_idx={used_idx} used_flags={used_flags:#x}"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn handle_acpi_pm_io_read(
+        &self,
+        port: Port,
+        width: AccessWidth,
+    ) -> AxResult<Option<usize>> {
+        if !(ACPI_PM_IO_BASE..ACPI_PM_IO_BASE + ACPI_PM_IO_SIZE).contains(&port.number()) {
+            return Ok(None);
+        }
+        let value = unsafe {
+            match width {
+                AccessWidth::Byte => X86Port::<u8>::new(port.number()).read() as usize,
+                AccessWidth::Word => X86Port::<u16>::new(port.number()).read() as usize,
+                AccessWidth::Dword => X86Port::<u32>::new(port.number()).read() as usize,
+                AccessWidth::Qword => {
+                    return ax_err!(InvalidInput, "unsupported qword ACPI PM I/O read");
+                }
+            }
+        };
+        info!(
+            "[ACPI-PM-IO] in port={:#x} width={width:?} value={value:#x}",
+            port.number()
+        );
+        Ok(Some(value))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn handle_acpi_pm_io_write(
+        &self,
+        port: Port,
+        width: AccessWidth,
+        val: usize,
+    ) -> AxResult<bool> {
+        if !(ACPI_PM_IO_BASE..ACPI_PM_IO_BASE + ACPI_PM_IO_SIZE).contains(&port.number()) {
+            return Ok(false);
+        }
+        unsafe {
+            match width {
+                AccessWidth::Byte => X86Port::<u8>::new(port.number()).write(val as u8),
+                AccessWidth::Word => X86Port::<u16>::new(port.number()).write(val as u16),
+                AccessWidth::Dword => X86Port::<u32>::new(port.number()).write(val as u32),
+                AccessWidth::Qword => {
+                    return ax_err!(InvalidInput, "unsupported qword ACPI PM I/O write");
+                }
+            }
+        }
+        info!(
+            "[ACPI-PM-IO] out port={:#x} width={width:?} value={val:#x}",
+            port.number()
+        );
+        Ok(true)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn handle_fw_cfg_io_read(
+        &self,
+        port: Port,
+        width: AccessWidth,
+    ) -> AxResult<Option<usize>> {
         let mut g = self.inner_mut.lock();
         let value = match port.number() {
             FW_CFG_IO_DATA => Some(g.fw_cfg.read_port(width)),
@@ -1187,12 +1495,7 @@ impl AxVM {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn handle_fw_cfg_io_write(
-        &self,
-        port: Port,
-        width: AccessWidth,
-        val: usize,
-    ) -> AxResult<bool> {
+    fn handle_fw_cfg_io_write(&self, port: Port, width: AccessWidth, val: usize) -> AxResult<bool> {
         match port.number() {
             FW_CFG_IO_SELECTOR if width == AccessWidth::Word => {
                 self.inner_mut.lock().fw_cfg.select(val as u16);
