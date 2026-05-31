@@ -358,6 +358,7 @@ pub struct AxVM {
     id: usize,
     inner_const: Once<AxVMInnerConst>,
     inner_mut: Mutex<AxVMInnerMut>,
+    debugcon_buf: Mutex<Vec<u8>>,
 }
 
 impl AxVM {
@@ -384,6 +385,7 @@ impl AxVM {
                 #[cfg(target_arch = "x86_64")]
                 ovmf_virtio_blk: OvmfVirtioBlkIoState::default(),
             }),
+            debugcon_buf: Mutex::new(Vec::new()),
         });
 
         info!("VM created: id={}", result.id());
@@ -783,7 +785,7 @@ impl AxVM {
             .vcpu(vcpu_id)
             .ok_or_else(|| ax_err_type!(InvalidInput, "Invalid vcpu_id"))?;
 
-        vcpu.bind()?;
+vcpu.bind()?;
 
         let exit_reason = vcpu.with_current_cpu_set(|| -> AxResult<AxVCpuExitReason> {
             loop {
@@ -815,11 +817,11 @@ impl AxVM {
                     AxVCpuExitReason::IoRead { port, width } => {
                         let val = {
                             #[cfg(target_arch = "x86_64")]
-                            if let Some(val) = self.handle_fw_cfg_io_read(port, width)? {
+                            if port.number() == 0x402 {
+                                0xE9 // OVMF debugcon 默认读回标志
+                            } else if let Some(val) = self.handle_fw_cfg_io_read(port, width)? {
                                 val
-                            } else if let Some(val) =
-                                self.handle_ovmf_virtio_blk_io_read(port, width)?
-                            {
+                            } else if let Some(val) = self.handle_ovmf_virtio_blk_io_read(port, width)? {
                                 val
                             } else if let Some(val) = self.handle_acpi_pm_io_read(port, width)? {
                                 val
@@ -832,20 +834,18 @@ impl AxVM {
                         };
 
                         #[cfg(not(target_arch = "riscv64"))]
-                        vcpu.set_gpr(0, val); // Target is always eax/ax/al
+                        vcpu.set_gpr(0, val);
 
                         #[cfg(target_arch = "riscv64")]
                         vcpu.set_gpr(riscv_vcpu::GprIndex::A0 as usize, val);
                     }
                     AxVCpuExitReason::IoWrite { port, width, data } => {
                         #[cfg(target_arch = "x86_64")]
-                        if self.handle_fw_cfg_io_write(port, width, data as usize)? {
+                        if port.number() == 0x402 {
+                            self.debugcon_write_bytes(&[data as u8]);
+                        } else if self.handle_fw_cfg_io_write(port, width, data as usize)? {
                             // 成功由 fw_cfg 处理
-                        } else if self.handle_ovmf_virtio_blk_io_write(
-                            port,
-                            width,
-                            data as usize,
-                        )? {
+                        } else if self.handle_ovmf_virtio_blk_io_write(port, width, data as usize)? {
                             // 成功由 ovmf_virtio_blk 处理
                         } else if self.handle_acpi_pm_io_write(port, width, data as usize)? {
                             // 成功由 acpi_pm 处理
@@ -857,6 +857,54 @@ impl AxVM {
                         #[cfg(not(target_arch = "x86_64"))]
                         self.get_devices()
                             .handle_port_write(port, width, data as usize)?;
+                    }
+                    AxVCpuExitReason::IoStringRead {
+                        port,
+                        width: _,
+                        dst_gpa,
+                        count,
+                    } => {
+                        #[cfg(target_arch = "x86_64")]
+                        if port.number() == 0x402 {
+                            let fill = alloc::vec![0xE9u8; count];
+                            self.write_guest_bytes(dst_gpa, &fill)?;
+                        } else {
+                            warn!("Unhandled string I/O read from port {:#x}", port.number());
+                        }
+
+                        #[cfg(not(target_arch = "x86_64"))]
+                        warn!("Unhandled string I/O read from port {:#x}", port.number());
+                    }
+                    AxVCpuExitReason::IoStringWrite {
+                        port,
+                        width: _,
+                        src_gpa,
+                        count,
+                    } => {
+                        #[cfg(target_arch = "x86_64")]
+                        if port.number() == 0x402 {
+                            let data = self.read_guest_bytes(src_gpa, count)?;
+                            self.debugcon_write_bytes(&data);
+                        } else {
+                            warn!("Unhandled string I/O write to port {:#x}", port.number());
+                        }
+
+                        #[cfg(not(target_arch = "x86_64"))]
+                        warn!("Unhandled string I/O write to port {:#x}", port.number());
+                    }
+                    AxVCpuExitReason::SysRegRead { addr, reg } => {
+                        let val = self.get_devices().handle_sys_reg_read(
+                            addr,
+                            AccessWidth::Qword,
+                        )?;
+                        vcpu.set_gpr(reg, val);
+                    }
+                    AxVCpuExitReason::SysRegWrite { addr, value } => {
+                        self.get_devices().handle_sys_reg_write(
+                            addr,
+                            AccessWidth::Qword,
+                            value as usize,
+                        )?;
                     }
                     AxVCpuExitReason::NestedPageFault { addr, access_flags } => {
                         if !self.handle_nested_page_fault(addr, access_flags) {
@@ -1111,6 +1159,61 @@ impl AxVM {
                 Ok(())
             }
             None => ax_err!(InvalidInput, "Failed to translate guest physical address"),
+        }
+    }
+
+    /// Reads raw bytes from guest physical memory.
+    fn read_guest_bytes(&self, gpa: GuestPhysAddr, len: usize) -> AxResult<Vec<u8>> {
+        let g = self.inner_mut.lock();
+        match g.address_space.translated_byte_buffer(gpa, len) {
+            Some(buffers) => {
+                let mut data = Vec::with_capacity(len);
+                for chunk in buffers {
+                    let remaining = len - data.len();
+                    let chunk_size = remaining.min(chunk.len());
+                    data.extend_from_slice(&chunk[..chunk_size]);
+                    if data.len() >= len {
+                        break;
+                    }
+                }
+                Ok(data)
+            }
+            None => ax_err!(InvalidInput, "Failed to translate guest physical address"),
+        }
+    }
+
+    /// Writes raw bytes to guest physical memory.
+    fn write_guest_bytes(&self, gpa: GuestPhysAddr, data: &[u8]) -> AxResult {
+        let g = self.inner_mut.lock();
+        match g.address_space.translated_byte_buffer(gpa, data.len()) {
+            Some(mut buffers) => {
+                let mut offset = 0;
+                for chunk in buffers.iter_mut() {
+                    let end = (offset + chunk.len()).min(data.len());
+                    let copy_len = end - offset;
+                    chunk[..copy_len].copy_from_slice(&data[offset..end]);
+                    offset = end;
+                }
+                Ok(())
+            }
+            None => ax_err!(InvalidInput, "Failed to translate guest physical address"),
+        }
+    }
+
+    /// Appends bytes to the debugcon buffer, flushing complete lines.
+    fn debugcon_write_bytes(&self, data: &[u8]) {
+        let mut buf = self.debugcon_buf.lock();
+        for &byte in data {
+            if byte == b'\n' {
+                if let Ok(line) = core::str::from_utf8(&buf) {
+                    info!("OVMF debugcon: {}", line);
+                } else {
+                    info!("OVMF debugcon: {:?}", buf);
+                }
+                buf.clear();
+            } else {
+                buf.push(byte);
+            }
         }
     }
 

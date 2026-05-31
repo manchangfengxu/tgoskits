@@ -1997,10 +1997,48 @@ impl AxArchVCpu for VmxVcpu {
 
                         let port = io_info.port;
 
-                        if io_info.is_repeat || io_info.is_string {
-                            warn!("VMX unsupported IO-Exit: {io_info:#x?} of {exit_info:#x?}");
-                            warn!("VCpu {self:#x?}");
-                            AxVCpuExitReason::Halt
+                        if io_info.is_string {
+                            let width = match AccessWidth::try_from(io_info.access_size as usize) {
+                                Ok(width) => width,
+                                Err(_) => {
+                                    warn!("VMX invalid string IO-Exit: {io_info:#x?} of {exit_info:#x?}");
+                                    return Ok(AxVCpuExitReason::Halt);
+                                }
+                            };
+
+                            let count = if io_info.is_repeat {
+                                self.regs().rcx as usize
+                            } else {
+                                1
+                            };
+
+                            let access_bytes = io_info.access_size as u64 * count as u64;
+
+                            if io_info.is_in {
+                                let dst_gpa = GuestPhysAddr::from_usize(self.regs().rdi as usize);
+                                self.regs_mut().rdi = self.regs().rdi.wrapping_add(access_bytes);
+                                if io_info.is_repeat {
+                                    self.regs_mut().rcx = 0;
+                                }
+                                AxVCpuExitReason::IoStringRead {
+                                    port: Port(port),
+                                    width,
+                                    dst_gpa,
+                                    count,
+                                }
+                            } else {
+                                let src_gpa = GuestPhysAddr::from_usize(self.regs().rsi as usize);
+                                self.regs_mut().rsi = self.regs().rsi.wrapping_add(access_bytes);
+                                if io_info.is_repeat {
+                                    self.regs_mut().rcx = 0;
+                                }
+                                AxVCpuExitReason::IoStringWrite {
+                                    port: Port(port),
+                                    width,
+                                    src_gpa,
+                                    count,
+                                }
+                            }
                         } else {
                             let width = match AccessWidth::try_from(io_info.access_size as usize) {
                                 Ok(width) => width,

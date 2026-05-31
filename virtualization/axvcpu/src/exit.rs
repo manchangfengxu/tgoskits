@@ -152,6 +152,40 @@ pub enum AxVCpuExitReason {
         data: u64,
     },
 
+    /// The guest performed a string port I/O read operation (`rep insb/insw/insd`).
+    ///
+    /// **Architecture**: x86-specific.
+    ///
+    /// The destination buffer is at guest physical address `dst_gpa` (from RDI),
+    /// and `count` bytes (from RCX) should be filled.
+    IoStringRead {
+        /// I/O port number being read from
+        port: Port,
+        /// Width of each I/O access (8, 16, or 32 bits)
+        width: AccessWidth,
+        /// Guest physical address of the destination buffer (RDI)
+        dst_gpa: GuestPhysAddr,
+        /// Number of repetitions (RCX)
+        count: usize,
+    },
+
+    /// The guest performed a string port I/O write operation (`rep outsb/outsw/outsd`).
+    ///
+    /// **Architecture**: x86-specific.
+    ///
+    /// The source buffer is at guest physical address `src_gpa` (from RSI),
+    /// and `count` elements should be written.
+    IoStringWrite {
+        /// I/O port number being written to
+        port: Port,
+        /// Width of each I/O access (8, 16, or 32 bits)
+        width: AccessWidth,
+        /// Guest physical address of the source buffer (RSI)
+        src_gpa: GuestPhysAddr,
+        /// Number of repetitions (RCX)
+        count: usize,
+    },
+
     /// An external interrupt was delivered to the VCpu.
     ///
     /// This represents hardware interrupts from external devices that need
