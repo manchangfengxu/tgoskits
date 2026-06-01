@@ -44,8 +44,8 @@ use super::{
     definitions::VmxExitReason,
     structs::{IOBitmap, MsrBitmap, VmxRegion},
     vmcs::{
-        self, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32, VmcsGuest64,
-        ApicAccessExitType, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW,
+        self, ApicAccessExitType, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16,
+        VmcsGuest32, VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW,
         VmcsReadOnly32, VmcsReadOnly64, VmcsReadOnlyNW,
     },
 };
@@ -525,8 +525,7 @@ impl VmxVcpu {
             .set_write_intercept(IA32_UMWAIT_CONTROL, true);
         self.msr_bitmap
             .set_read_intercept(IA32_UMWAIT_CONTROL, true);
-        self.msr_bitmap
-            .set_read_intercept(IA32_MTRR_DEF_TYPE, true);
+        self.msr_bitmap.set_read_intercept(IA32_MTRR_DEF_TYPE, true);
         self.msr_bitmap
             .set_write_intercept(IA32_MTRR_DEF_TYPE, true);
 
@@ -1495,8 +1494,7 @@ impl VmxVcpu {
                 let host_ebx = res.ebx;
                 let host_edx = res.edx;
                 let apic_id = (self.vcpu_id as u32) & 0xff;
-                let logical_processor_count =
-                    (host::current_vm_vcpu_num() as u32).clamp(1, 0xff);
+                let logical_processor_count = (host::current_vm_vcpu_num() as u32).clamp(1, 0xff);
                 res.ecx &= !FEATURE_VMX;
                 res.ecx |= FEATURE_X2APIC;
                 res.ecx &= !FEATURE_TSC_DEADLINE;
@@ -2001,7 +1999,10 @@ impl AxArchVCpu for VmxVcpu {
                             let width = match AccessWidth::try_from(io_info.access_size as usize) {
                                 Ok(width) => width,
                                 Err(_) => {
-                                    warn!("VMX invalid string IO-Exit: {io_info:#x?} of {exit_info:#x?}");
+                                    warn!(
+                                        "VMX invalid string IO-Exit: {io_info:#x?} of \
+                                         {exit_info:#x?}"
+                                    );
                                     return Ok(AxVCpuExitReason::Halt);
                                 }
                             };

@@ -23,17 +23,14 @@ use axaddrspace::{AddrSpace, MappingFlags};
 use axdevice::{AxVmDeviceConfig, AxVmDevices};
 use axdevice_base::{AccessWidth, Port};
 use axvcpu::{AxVCpu, AxVCpuExitReason};
-
 #[cfg(target_arch = "x86_64")]
 use axvm_types::EmulatedDeviceType;
 use axvm_types::{GuestPhysAddr, HostPhysAddr, HostVirtAddr};
 use spin::Once;
-
-#[cfg(all(target_arch = "x86_64", feature = "vmx"))]
-use x86_vcpu::{X86_APIC_ACCESS_GPA, x86_apic_access_page_addr};
-
 #[cfg(target_arch = "x86_64")]
 use x86_64::instructions::port::Port as X86Port;
+#[cfg(all(target_arch = "x86_64", feature = "vmx"))]
+use x86_vcpu::{X86_APIC_ACCESS_GPA, x86_apic_access_page_addr};
 
 #[cfg(not(target_arch = "x86_64"))]
 use crate::vcpu::AxVCpuCreateConfig;
@@ -785,7 +782,7 @@ impl AxVM {
             .vcpu(vcpu_id)
             .ok_or_else(|| ax_err_type!(InvalidInput, "Invalid vcpu_id"))?;
 
-vcpu.bind()?;
+        vcpu.bind()?;
 
         let exit_reason = vcpu.with_current_cpu_set(|| -> AxResult<AxVCpuExitReason> {
             loop {
@@ -821,7 +818,9 @@ vcpu.bind()?;
                                 0xE9 // OVMF debugcon 默认读回标志
                             } else if let Some(val) = self.handle_fw_cfg_io_read(port, width)? {
                                 val
-                            } else if let Some(val) = self.handle_ovmf_virtio_blk_io_read(port, width)? {
+                            } else if let Some(val) =
+                                self.handle_ovmf_virtio_blk_io_read(port, width)?
+                            {
                                 val
                             } else if let Some(val) = self.handle_acpi_pm_io_read(port, width)? {
                                 val
@@ -845,7 +844,11 @@ vcpu.bind()?;
                             self.debugcon_write_bytes(&[data as u8]);
                         } else if self.handle_fw_cfg_io_write(port, width, data as usize)? {
                             // 成功由 fw_cfg 处理
-                        } else if self.handle_ovmf_virtio_blk_io_write(port, width, data as usize)? {
+                        } else if self.handle_ovmf_virtio_blk_io_write(
+                            port,
+                            width,
+                            data as usize,
+                        )? {
                             // 成功由 ovmf_virtio_blk 处理
                         } else if self.handle_acpi_pm_io_write(port, width, data as usize)? {
                             // 成功由 acpi_pm 处理
@@ -893,10 +896,9 @@ vcpu.bind()?;
                         warn!("Unhandled string I/O write to port {:#x}", port.number());
                     }
                     AxVCpuExitReason::SysRegRead { addr, reg } => {
-                        let val = self.get_devices().handle_sys_reg_read(
-                            addr,
-                            AccessWidth::Qword,
-                        )?;
+                        let val = self
+                            .get_devices()
+                            .handle_sys_reg_read(addr, AccessWidth::Qword)?;
                         vcpu.set_gpr(reg, val);
                     }
                     AxVCpuExitReason::SysRegWrite { addr, value } => {
@@ -1531,11 +1533,7 @@ vcpu.bind()?;
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn handle_acpi_pm_io_read(
-        &self,
-        port: Port,
-        width: AccessWidth,
-    ) -> AxResult<Option<usize>> {
+    fn handle_acpi_pm_io_read(&self, port: Port, width: AccessWidth) -> AxResult<Option<usize>> {
         if !(ACPI_PM_IO_BASE..ACPI_PM_IO_BASE + ACPI_PM_IO_SIZE).contains(&port.number()) {
             return Ok(None);
         }
@@ -1584,11 +1582,7 @@ vcpu.bind()?;
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn handle_fw_cfg_io_read(
-        &self,
-        port: Port,
-        width: AccessWidth,
-    ) -> AxResult<Option<usize>> {
+    fn handle_fw_cfg_io_read(&self, port: Port, width: AccessWidth) -> AxResult<Option<usize>> {
         let mut g = self.inner_mut.lock();
         let value = match port.number() {
             FW_CFG_IO_DATA => Some(g.fw_cfg.read_port(width)),
