@@ -28,6 +28,8 @@ extern crate log;
 
 mod config;
 mod device;
+#[cfg(target_arch = "x86_64")]
+pub mod fw_cfg;
 mod range_alloc;
 
 pub use axdevice_base::{

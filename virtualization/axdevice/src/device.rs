@@ -32,7 +32,7 @@ use riscv_vplic::VPlicGlobal;
 #[cfg(target_arch = "x86_64")]
 use x86_vlapic::{EmulatedIoApic, EmulatedPit, EmulatedSerialPort, IoApicInterrupt};
 
-use crate::{AxVmDeviceConfig, range_alloc::RangeAllocator};
+use crate::{AxVmDeviceConfig, fw_cfg::FwCfgDevice, range_alloc::RangeAllocator};
 
 const OVMF_DEBUGCON_PORT: u16 = 0x402;
 
@@ -151,6 +151,8 @@ pub struct AxVmDevices {
     x86_pit: Option<Arc<EmulatedPit>>,
     #[cfg(target_arch = "x86_64")]
     x86_serial: Option<Arc<EmulatedSerialPort>>,
+    #[cfg(target_arch = "x86_64")]
+    x86_fw_cfg: Option<Arc<FwCfgDevice>>,
     /// IVC channel range allocator
     ivc_channel: Option<Mutex<RangeAllocator>>,
 }
@@ -195,12 +197,17 @@ impl AxVmDevices {
             x86_pit: None,
             #[cfg(target_arch = "x86_64")]
             x86_serial: None,
+            #[cfg(target_arch = "x86_64")]
+            x86_fw_cfg: None,
             ivc_channel: None,
         };
 
         Self::init(&mut this, &config.emu_configs);
         #[cfg(target_arch = "x86_64")]
         {
+            let fw_cfg = Arc::new(FwCfgDevice::new());
+            this.x86_fw_cfg = Some(Arc::clone(&fw_cfg));
+            this.add_port_dev(fw_cfg);
             this.add_port_dev(Arc::new(OvmfDebugConDevice::new()));
         }
         this
@@ -552,6 +559,41 @@ impl AxVmDevices {
         self.x86_serial
             .as_ref()
             .is_some_and(|serial| serial.poll_irq())
+    }
+
+    /// Configure fw_cfg items from the VM memory map and CPU count.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_fw_cfg_configure(&self, memory_regions: &[(u64, u64)], cpu_count: usize) {
+        if let Some(fw_cfg) = &self.x86_fw_cfg {
+            fw_cfg.configure(memory_regions, cpu_count);
+        }
+    }
+
+    /// Read fw_cfg bytes from the currently-selected item (for string I/O).
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_fw_cfg_read_string_bytes(&self, count: usize) -> Vec<u8> {
+        self.x86_fw_cfg
+            .as_ref()
+            .map_or_else(Vec::new, |fw_cfg| fw_cfg.read_string_bytes(count))
+    }
+
+    /// Execute a pending fw_cfg DMA transfer against guest memory.
+    ///
+    /// If a DMA descriptor was accumulated by a prior port write, this reads
+    /// the descriptor from guest memory, performs the requested operation, and
+    /// writes the status word back. Returns `Ok(())` when there is no pending
+    /// DMA or when the transfer completes.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_fw_cfg_execute_pending_dma<M: axaddrspace::GuestMemoryAccessor>(
+        &self,
+        mem: &M,
+    ) -> AxResult {
+        if let Some(fw_cfg) = &self.x86_fw_cfg
+            && let Some(dma_gpa) = fw_cfg.take_pending_dma()
+        {
+            fw_cfg.execute_dma(dma_gpa, mem)?;
+        }
+        Ok(())
     }
 
     /// Iterates over the MMIO devices in the set.

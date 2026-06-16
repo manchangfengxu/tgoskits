@@ -231,11 +231,13 @@ pub enum EmulatedDeviceType {
     /// ARM GIC Partial Passthrough Interrupt Translation Service device.
     GPPTITS             = 0x22,
 
-    // 0x23 - 0x24: x86 platform devices.
+    // 0x23 - 0x25: x86 platform devices.
     /// x86 virtual IO APIC device.
     X86IoApic           = 0x23,
     /// x86 virtual PIT/8254 timer device.
     X86Pit              = 0x24,
+    /// x86 QEMU fw_cfg firmware configuration device.
+    X86FwCfg            = 0x25,
 
     // 0x30: PPPT (PLIC Partial Passthrough) devices.
     /// RISC-V PLIC Partial Passthrough Global device.
@@ -271,6 +273,7 @@ impl Display for EmulatedDeviceType {
             EmulatedDeviceType::GPPTITS => write!(f, "gic partial passthrough its"),
             EmulatedDeviceType::X86IoApic => write!(f, "x86 io apic"),
             EmulatedDeviceType::X86Pit => write!(f, "x86 pit"),
+            EmulatedDeviceType::X86FwCfg => write!(f, "x86 fw_cfg"),
             EmulatedDeviceType::PPPTGlobal => write!(f, "plic partial passthrough global"),
             // EmulatedDeviceType::IOMMU => write!(f, "iommu"),
             // EmulatedDeviceType::ICCSRE => write!(f, "interrupt icc sre"),
@@ -287,7 +290,7 @@ impl Display for EmulatedDeviceType {
 
 impl EmulatedDeviceType {
     /// All known emulated device types.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         EmulatedDeviceType::Dummy,
         EmulatedDeviceType::InterruptController,
         EmulatedDeviceType::Console,
@@ -297,6 +300,7 @@ impl EmulatedDeviceType {
         EmulatedDeviceType::GPPTITS,
         EmulatedDeviceType::X86IoApic,
         EmulatedDeviceType::X86Pit,
+        EmulatedDeviceType::X86FwCfg,
         EmulatedDeviceType::PPPTGlobal,
         EmulatedDeviceType::VirtioBlk,
         EmulatedDeviceType::VirtioNet,
@@ -318,6 +322,7 @@ impl EmulatedDeviceType {
                 | EmulatedDeviceType::GPPTRedistributor
                 | EmulatedDeviceType::X86IoApic
                 | EmulatedDeviceType::X86Pit
+                | EmulatedDeviceType::X86FwCfg
                 | EmulatedDeviceType::VirtioBlk
                 | EmulatedDeviceType::VirtioNet
                 // | EmulatedDeviceType::GICR
@@ -337,6 +342,7 @@ impl EmulatedDeviceType {
             0x22 => Some(EmulatedDeviceType::GPPTITS),
             0x23 => Some(EmulatedDeviceType::X86IoApic),
             0x24 => Some(EmulatedDeviceType::X86Pit),
+            0x25 => Some(EmulatedDeviceType::X86FwCfg),
             0x30 => Some(EmulatedDeviceType::PPPTGlobal),
             0xE1 => Some(EmulatedDeviceType::VirtioBlk),
             0xE2 => Some(EmulatedDeviceType::VirtioNet),
