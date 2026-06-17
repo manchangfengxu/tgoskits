@@ -54,22 +54,14 @@ impl BaseDeviceOps<PortRange> for OvmfDebugConDevice {
     }
 
     fn address_range(&self) -> PortRange {
-        PortRange::new(
-            Port::new(OVMF_DEBUGCON_PORT),
-            Port::new(OVMF_DEBUGCON_PORT),
-        )
+        PortRange::new(Port::new(OVMF_DEBUGCON_PORT), Port::new(OVMF_DEBUGCON_PORT))
     }
 
     fn handle_read(&self, _addr: Port, _width: AccessWidth) -> AxResult<usize> {
         Ok(0xE9)
     }
 
-    fn handle_write(
-        &self,
-        _addr: Port,
-        width: AccessWidth,
-        val: usize,
-    ) -> AxResult {
+    fn handle_write(&self, _addr: Port, width: AccessWidth, val: usize) -> AxResult {
         if width == AccessWidth::Byte {
             let byte = val as u8;
             let mut line = self.line.lock();
@@ -594,6 +586,15 @@ impl AxVmDevices {
             fw_cfg.execute_dma(dma_gpa, mem)?;
         }
         Ok(())
+    }
+
+    /// Add a named fw_cfg file item backed by raw bytes.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_fw_cfg_add_bytes_file(&self, name: &str, bytes: Vec<u8>) -> AxResult<u16> {
+        let Some(fw_cfg) = &self.x86_fw_cfg else {
+            return ax_err!(NotFound, "x86 fw_cfg device is not initialized");
+        };
+        fw_cfg.add_file_item(name, crate::fw_cfg::FwCfgContent::Bytes(bytes))
     }
 
     /// Iterates over the MMIO devices in the set.

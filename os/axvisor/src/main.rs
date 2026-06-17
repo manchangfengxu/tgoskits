@@ -44,6 +44,8 @@ mod fdt;
 mod images;
 mod manager;
 mod shell;
+#[cfg(target_arch = "x86_64")]
+mod x86_fw_cfg;
 
 use std::println;
 

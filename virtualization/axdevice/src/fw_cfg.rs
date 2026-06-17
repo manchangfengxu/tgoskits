@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{collections::BTreeMap, string::String, vec, vec::Vec};
+use alloc::{collections::BTreeMap, format, string::String, vec, vec::Vec};
 
 use ax_errno::{AxResult, ax_err};
 use ax_kspin::SpinNoIrq as Mutex;
@@ -20,7 +20,7 @@ use axaddrspace::GuestMemoryAccessor;
 use axdevice_base::{AccessWidth, BaseDeviceOps, Port, PortRange};
 use axvm_types::{EmulatedDeviceType, GuestPhysAddr};
 
-const FW_CFG_IO_SELECTOR: u16 = 0x510;
+pub const FW_CFG_IO_SELECTOR: u16 = 0x510;
 /// Port number for the fw_cfg data register.
 pub const FW_CFG_IO_DATA: u16 = 0x511;
 const FW_CFG_IO_DMA_ADDRESS: u16 = 0x514;
@@ -30,7 +30,7 @@ const QEMU_FW_CFG_FNAME_SIZE: usize = 56;
 const QEMU_FW_CFG_ITEM_SIGNATURE: u16 = 0x0000;
 const QEMU_FW_CFG_ITEM_INTERFACE_VERSION: u16 = 0x0001;
 const QEMU_FW_CFG_ITEM_SMP_CPU_COUNT: u16 = 0x0005;
-const QEMU_FW_CFG_ITEM_FILE_DIR: u16 = 0x0019;
+pub const QEMU_FW_CFG_ITEM_FILE_DIR: u16 = 0x0019;
 const QEMU_FW_CFG_ITEM_ETC_E820: u16 = 0x8000;
 const FW_CFG_FILE_FIRST: u16 = 0x0020;
 
@@ -48,6 +48,13 @@ pub const FW_CFG_DMA_CTL_WRITE: u32 = 1 << 4;
 pub enum FwCfgContent {
     Bytes(Vec<u8>),
     U32(u32),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FwCfgFileDirEntry {
+    pub size: usize,
+    pub selector: u16,
+    pub name: String,
 }
 
 impl FwCfgContent {
@@ -415,13 +422,72 @@ fn append_u64_le(buffer: &mut Vec<u8>, value: u64) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
 
+pub fn parse_file_directory(bytes: &[u8]) -> AxResult<Vec<FwCfgFileDirEntry>> {
+    if bytes.len() < size_of::<u32>() {
+        return ax_err!(
+            InvalidInput,
+            "fw_cfg file directory is missing the entry count"
+        );
+    }
+
+    let count = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let expected_len = size_of::<u32>()
+        + count * (size_of::<u32>() + size_of::<u16>() * 2 + QEMU_FW_CFG_FNAME_SIZE);
+    if bytes.len() < expected_len {
+        return ax_err!(
+            InvalidInput,
+            format!(
+                "fw_cfg file directory is truncated: expected at least {expected_len} bytes, got \
+                 {}",
+                bytes.len()
+            )
+        );
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    let mut offset = size_of::<u32>();
+    for _ in 0..count {
+        let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let selector = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap());
+        offset += 2;
+        offset += 2; // reserved
+
+        let raw_name = &bytes[offset..offset + QEMU_FW_CFG_FNAME_SIZE];
+        offset += QEMU_FW_CFG_FNAME_SIZE;
+        let name_end = raw_name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(QEMU_FW_CFG_FNAME_SIZE);
+        let name = match core::str::from_utf8(&raw_name[..name_end]) {
+            Ok(name) => name,
+            Err(err) => {
+                return ax_err!(
+                    InvalidInput,
+                    format!("fw_cfg file directory name is not valid UTF-8: {err}")
+                );
+            }
+        };
+
+        entries.push(FwCfgFileDirEntry {
+            size,
+            selector,
+            name: String::from(name),
+        });
+    }
+
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use axdevice_base::AccessWidth;
 
     use super::{
         FwCfgContent, FwCfgDmaRequest, FwCfgInner, QEMU_FW_CFG_ITEM_FILE_DIR,
-        QEMU_FW_CFG_ITEM_INTERFACE_VERSION, QEMU_FW_CFG_ITEM_SIGNATURE,
+        QEMU_FW_CFG_ITEM_INTERFACE_VERSION, QEMU_FW_CFG_ITEM_SIGNATURE, parse_file_directory,
     };
 
     #[test]
@@ -527,5 +593,42 @@ mod tests {
         assert_eq!(request.control, 0x0008_0002);
         assert_eq!(request.length, 0x1000);
         assert_eq!(request.address.as_usize(), 0x1234_5678_9abc_def0usize);
+    }
+
+    #[test]
+    fn parse_file_directory_decodes_big_endian_entries() {
+        let mut dir = Vec::new();
+        dir.extend_from_slice(&2u32.to_be_bytes());
+
+        dir.extend_from_slice(&0x20u32.to_be_bytes());
+        dir.extend_from_slice(&0x0042u16.to_be_bytes());
+        dir.extend_from_slice(&0u16.to_be_bytes());
+        let mut name = [0u8; 56];
+        name[..14].copy_from_slice(b"etc/acpi/rsdp\0");
+        dir.extend_from_slice(&name);
+
+        dir.extend_from_slice(&0x80u32.to_be_bytes());
+        dir.extend_from_slice(&0x0043u16.to_be_bytes());
+        dir.extend_from_slice(&0u16.to_be_bytes());
+        let mut name = [0u8; 56];
+        name[..16].copy_from_slice(b"etc/acpi/tables\0");
+        dir.extend_from_slice(&name);
+
+        let entries = parse_file_directory(&dir).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].size, 0x20);
+        assert_eq!(entries[0].selector, 0x0042);
+        assert_eq!(entries[0].name, "etc/acpi/rsdp");
+        assert_eq!(entries[1].size, 0x80);
+        assert_eq!(entries[1].selector, 0x0043);
+        assert_eq!(entries[1].name, "etc/acpi/tables");
+    }
+
+    #[test]
+    fn parse_file_directory_rejects_truncated_payload() {
+        let dir = 1u32.to_be_bytes();
+
+        assert!(parse_file_directory(&dir).is_err());
     }
 }

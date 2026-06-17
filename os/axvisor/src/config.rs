@@ -34,6 +34,8 @@ use axvmconfig::{AxVMCrateConfig, VMType, VmMemConfig, VmMemMappingType};
 ))]
 use crate::fdt::*;
 use crate::images::ImageLoader;
+#[cfg(target_arch = "x86_64")]
+use crate::x86_fw_cfg::cached_outer_qemu_acpi_fw_cfg_blobs;
 
 /// Default BIOS load GPA for x86_64 built-in BIOS.
 #[cfg(target_arch = "x86_64")]
@@ -160,6 +162,8 @@ pub fn init_guest_vm(raw_cfg: &str) -> AxResult<usize> {
     let skip_guest_address_adjustment = x86_linux_direct_boot_config(&vm_create_config);
     #[cfg(not(target_arch = "x86_64"))]
     let skip_guest_address_adjustment = false;
+    #[cfg(target_arch = "x86_64")]
+    let install_outer_qemu_acpi = x86_uefi_ovmf_fw_cfg_forwarding_required(&vm_create_config);
 
     // info!("after parse_vm_interrupt, crate VM[{}] with config: {:#?}", vm_config.id(), vm_config);
     info!("Creating VM[{}] {:?}", vm_config.id(), vm_config.name());
@@ -193,6 +197,18 @@ pub fn init_guest_vm(raw_cfg: &str) -> AxResult<usize> {
 
     vm.init()
         .map_err(|e| ax_err_type!(InvalidData, format!("VM[{}] setup failed: {e:?}", vm.id())))?;
+    #[cfg(target_arch = "x86_64")]
+    if install_outer_qemu_acpi {
+        install_outer_qemu_acpi_fw_cfg(&vm).map_err(|e| {
+            ax_err_type!(
+                InvalidData,
+                format!(
+                    "VM[{}] failed to install outer QEMU ACPI fw_cfg blobs: {e:?}",
+                    vm.id()
+                )
+            )
+        })?;
+    }
 
     vm.set_vm_status(axvm::VMStatus::Loaded);
     if !axvm::register_vm(vm) {
@@ -308,6 +324,23 @@ fn config_guest_address(vm: &AxVMRef, main_memory: &VMMemoryRegion, boot_protoco
 #[cfg(target_arch = "x86_64")]
 fn x86_linux_direct_boot_config(config: &AxVMCrateConfig) -> bool {
     crate::images::is_x86_linux_image_config(config)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_uefi_ovmf_fw_cfg_forwarding_required(config: &AxVMCrateConfig) -> bool {
+    config.kernel.effective_boot_protocol() == VMBootProtocol::Uefi
+        && config.kernel.ovmf_code_path.is_some()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn install_outer_qemu_acpi_fw_cfg(vm: &AxVMRef) -> AxResult {
+    let blobs = cached_outer_qemu_acpi_fw_cfg_blobs()?;
+    info!("VM[{}] forwarding outer QEMU ACPI fw_cfg blobs", vm.id());
+    for (name, bytes) in blobs.entries() {
+        vm.get_devices()
+            .x86_fw_cfg_add_bytes_file(name, bytes.to_vec())?;
+    }
+    Ok(())
 }
 
 fn vm_alloc_memory_regions(vm_create_config: &AxVMCrateConfig, vm: &AxVMRef) -> AxResult {
