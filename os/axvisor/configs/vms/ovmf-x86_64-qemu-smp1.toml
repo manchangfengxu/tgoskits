@@ -18,16 +18,16 @@ phys_cpu_sets = [1]
 [kernel]
 # UEFI guests should enter through the x86 reset vector.
 entry_point = 0xffff_fff0
-# UEFI boot mode is now parsed from the existing [kernel] section.
-boot = "uefi"
+# UEFI guests use the upstream boot_protocol field.
+boot_protocol = "uefi"
 # The location of image: "memory" | "fs".
 image_location = "fs"
 # Kept only because the current common config model still requires this field.
 kernel_path = "/guest/uefi/empty-kernel-placeholder.bin"
 # Kept as a legacy-required field; UEFI loading uses ovmf_code_base instead.
 kernel_load_addr = 0x20_0000
-# OVMF is not the current low-address AxVisor BIOS/trampoline image.
-enable_bios = false
+# The current axvmconfig model uses enable_bios for firmware-style boot paths.
+enable_bios = true
 
 # Read-only OVMF firmware code image.
 ovmf_code_path = "/guest/ovmf/OVMF_CODE.fd"
@@ -39,6 +39,8 @@ ovmf_vars_path = "/guest/ovmf/OVMF_VARS.fd"
 ovmf_vars_base = 0xffc0_0000
 # Explicit reset vector used to seed BSP entry during the first-stage adapter.
 reset_vector = 0xffff_fff0
+# Raw disk image exposed to OVMF through AxVisor's legacy virtio-blk model.
+disk_path = "/guest/disks/uefi-boot-test.img"
 
 # Memory regions with format (`base_paddr`, `size`, `flags`, `map_type`).
 # For `map_type`, 0 means `MAP_ALLOC`, 1 means `MAP_IDENTICAL`, 2 means `MAP_RESERVED`.

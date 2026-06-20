@@ -113,6 +113,19 @@ impl IOBitmap {
             self.set_intercept(port, intercept)
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_intercepted(&self, port: u32) -> bool {
+        let (port, io_bit_map_frame) = if port <= 0x7fff {
+            (port, &self.io_bitmap_a_frame)
+        } else {
+            (port - 0x8000, &self.io_bitmap_b_frame)
+        };
+        let bitmap = unsafe { core::slice::from_raw_parts(io_bit_map_frame.as_mut_ptr(), 4096) };
+        let byte = (port / 8) as usize;
+        let bits = port % 8;
+        bitmap[byte] & (1 << bits) != 0
+    }
 }
 
 #[derive(Debug)]

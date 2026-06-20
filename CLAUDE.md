@@ -1,3 +1,4 @@
+禁止commit,自用而不是推送到上游
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -11,6 +12,37 @@ TGOSKits is a monorepo workspace for OS and virtualization development, containi
 - **Axvisor** (`os/axvisor/`) — type-1 hypervisor built on ArceOS; adds vCPU/VM management, guest image loading
 
 Dependency flow: `components/` + `drivers/` → ArceOS modules → StarryOS / Axvisor
+
+## AxVisor OVMF workspace note
+
+This checkout may be used from the wrapper repository `axvisor-uefi/`. When working on the x86_64 OVMF / UEFI guest bring-up, first read the wrapper-level `../CLAUDE.md` and the latest notes under `../axvisor-2026-notebooks/develop/`. Those files are the current task contract for the OVMF workstream.
+
+Current OVMF workstream rules:
+
+- Do not modify OVMF / EDK2 logic code except for explicitly approved diagnostic logging.
+- Reuse AxVisor's existing infrastructure first. Small tail-end infrastructure is allowed only when it completes an already-present path.
+- Do not invent a local replacement for the future direction-2 bus/context/IRQ framework.
+- Keep reusable device protocol behavior in `virtualization/axdevice` when the current infrastructure can carry it. Keep `axvm` as VM context, guest-memory, and dispatch glue.
+- `fw_cfg` device behavior is in `virtualization/axdevice/src/fw_cfg.rs`; `os/axvisor/src/x86_fw_cfg.rs` reads outer QEMU ACPI fw_cfg blobs and registers them into nested fw_cfg for `x86_64 + UEFI + OVMF`.
+- Do not continue virtio-blk INTx wiring for the current OVMF DXE path unless the user explicitly reopens it. OVMF's virtio-blk boot path is polling based.
+
+Current OVMF smoke entry:
+
+```bash
+cd "$WORKSPACE/tgoskits/os/axvisor"
+timeout 45 cargo xtask qemu \
+  --config "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64.toml" \
+  --qemu-config "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64-runtime.toml" \
+  --vmconfigs "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/ovmf-x86_64-qemu-smp1.toml" \
+  --rootfs "$WORKSPACE/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img"
+```
+
+Expected OVMF workstream signals include:
+
+- `Loaded outer QEMU ACPI fw_cfg blobs`
+- `VM[...] forwarding outer QEMU ACPI fw_cfg blobs`
+- `FSOpen: Open '\EFI\BOOT\BOOTX64.EFI' Success`
+- `ArceOS UEFI shell-stage boot OK`
 
 ## Build System
 

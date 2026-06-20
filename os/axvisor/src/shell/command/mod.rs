@@ -479,7 +479,13 @@ pub fn prompt_string() -> String {
     #[cfg(feature = "fs")]
     {
         match std::env::current_dir() {
-            Ok(dir) => format!("axvisor:{}$ ", dir.display()),
+            Ok(dir) => {
+                #[cfg(target_os = "none")]
+                let dir = dir;
+                #[cfg(not(target_os = "none"))]
+                let dir = dir.display().to_string();
+                format!("axvisor:{}$ ", dir)
+            }
             Err(_) => "axvisor:$ ".to_string(),
         }
     }

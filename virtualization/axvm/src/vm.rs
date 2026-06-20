@@ -13,7 +13,11 @@
 // limitations under the License.
 
 use alloc::{boxed::Box, format, sync::Arc, vec::Vec};
-use core::{alloc::Layout, fmt};
+use core::{
+    alloc::Layout,
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use ax_cpumask::CpuMask;
 use ax_errno::{AxError, AxResult, ax_err, ax_err_type};
@@ -24,6 +28,8 @@ use ax_page_table_multiarch::PagingHandler;
 use axaddrspace::{AddrSpace, GuestMemoryAccessor, MappingFlags};
 #[cfg(target_arch = "x86_64")]
 use axdevice::fw_cfg::FW_CFG_IO_DATA;
+#[cfg(target_arch = "x86_64")]
+use axdevice::virtio_blk::{LEGACY_BLK_IO_BASE, LEGACY_BLK_IO_SIZE, LegacyVirtioBlk};
 use axdevice::{AxVmDeviceConfig, AxVmDevices};
 use axdevice_base::{AccessWidth, Port};
 use axvcpu::{AxVCpu, AxVCpuExitReason};
@@ -35,6 +41,8 @@ use spin::Once;
 use x86_64::instructions::port::Port as X86Port;
 #[cfg(all(target_arch = "x86_64", feature = "vmx"))]
 use x86_vcpu::{X86_APIC_ACCESS_GPA, x86_apic_access_page_addr};
+#[cfg(target_arch = "x86_64")]
+use x86_vlapic::LegacyPicLint0Route;
 
 #[cfg(not(target_arch = "x86_64"))]
 use crate::vcpu::AxVCpuCreateConfig;
@@ -50,17 +58,19 @@ const VM_ASPACE_BASE: usize = 0x0;
 const VM_ASPACE_SIZE: usize = 0x7fff_ffff_f000;
 
 #[cfg(target_arch = "x86_64")]
-const OVMF_VIRTIO_BLK_IO_BASE: u16 = 0x6000;
-#[cfg(target_arch = "x86_64")]
-const OVMF_VIRTIO_BLK_IO_SIZE: u16 = 0x80;
-#[cfg(target_arch = "x86_64")]
-const OVMF_VIRTIO_BLK_QUEUE_PFN: u16 = OVMF_VIRTIO_BLK_IO_BASE + 0x08;
-#[cfg(target_arch = "x86_64")]
-const OVMF_VIRTIO_BLK_QUEUE_NOTIFY: u16 = OVMF_VIRTIO_BLK_IO_BASE + 0x10;
-#[cfg(target_arch = "x86_64")]
 const ACPI_PM_IO_BASE: u16 = 0x600;
 #[cfg(target_arch = "x86_64")]
 const ACPI_PM_IO_SIZE: u16 = 0x10;
+#[cfg(target_arch = "x86_64")]
+const X86_PIT_TIMER_IRQ: usize = 0;
+#[cfg(target_arch = "x86_64")]
+const X86_PIT_TIMER_GSI: usize = 2;
+#[cfg(target_arch = "x86_64")]
+const X86_COM1_GSI: usize = 4;
+#[cfg(target_arch = "x86_64")]
+static X86_LEGACY_IRQ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
+const X86_LEGACY_IRQ_LOG_LIMIT: usize = 64;
 
 /// A vCPU with architecture-independent interface.
 type VCpu = AxVCpu<AxArchVCpuImpl>;
@@ -126,22 +136,12 @@ impl VMMemoryRegion {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy, Default)]
-struct OvmfVirtioBlkIoState {
-    queue_pfn: u32,
-    queue_size: u16,
-    translated_queue_pfn: u32,
-}
-
 struct AxVMInnerMut {
     // Todo: use more efficient lock.
     address_space: AddrSpace<HostPagingHandler>,
     memory_regions: Vec<VMMemoryRegion>,
     config: AxVMConfig,
     vm_status: VMStatus,
-    #[cfg(target_arch = "x86_64")]
-    ovmf_virtio_blk: OvmfVirtioBlkIoState,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -161,7 +161,6 @@ impl GuestMemoryAccessor for AxVmGuestMemory {
         Some((HostPhysAddr::from_usize(host_vaddr.as_usize()), limit))
     }
 }
-
 
 /// VM status enumeration representing the lifecycle states of a virtual machine
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +218,8 @@ pub struct AxVM {
     id: usize,
     inner_const: Once<AxVMInnerConst>,
     inner_mut: Mutex<AxVMInnerMut>,
+    #[cfg(target_arch = "x86_64")]
+    ovmf_virtio_blk: Mutex<LegacyVirtioBlk>,
     debugcon_buf: Mutex<Vec<u8>>,
 }
 
@@ -241,9 +242,9 @@ impl AxVM {
                 config,
                 memory_regions: Vec::new(),
                 vm_status: VMStatus::Loading,
-                #[cfg(target_arch = "x86_64")]
-                ovmf_virtio_blk: OvmfVirtioBlkIoState::default(),
             }),
+            #[cfg(target_arch = "x86_64")]
+            ovmf_virtio_blk: Mutex::new(LegacyVirtioBlk::new()),
             debugcon_buf: Mutex::new(Vec::new()),
         });
 
@@ -261,6 +262,150 @@ impl AxVM {
     /// Returns the configured VM interrupt mode.
     pub fn interrupt_mode(&self) -> VMInterruptMode {
         self.inner_mut.lock().config.interrupt_mode()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn inject_pending_x86_legacy_irqs(&self, vcpu: &AxVCpuRef) -> AxResult {
+        self.inject_due_x86_pit_irq0(vcpu)?;
+        self.inject_pending_x86_serial_irq(vcpu)?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn inject_due_x86_pit_irq0(&self, vcpu: &AxVCpuRef) -> AxResult {
+        if self.interrupt_mode() != VMInterruptMode::Passthrough {
+            return Ok(());
+        }
+
+        let now_ns = crate::host::arceos::monotonic_time_nanos();
+        let pit_due = self.get_devices().x86_pit_consume_irq0_if_due(now_ns);
+        if !pit_due {
+            return Ok(());
+        }
+
+        static PIT_TICK_LOG: AtomicUsize = AtomicUsize::new(0);
+        if PIT_TICK_LOG.fetch_add(1, Ordering::Relaxed) % 200 == 0 {
+            info!("inject_due_x86_pit_irq0: tick due at {now_ns}ns");
+        }
+
+        self.get_devices()
+            .x86_pic_assert_irq(X86_PIT_TIMER_IRQ, true);
+        self.get_devices()
+            .x86_pic_assert_irq(X86_PIT_TIMER_IRQ, false);
+
+        let lint0_observation = vcpu.get_arch_vcpu().lint0_observation();
+        let gsi2_vector = self
+            .get_devices()
+            .x86_ioapic_vector_for_gsi(X86_PIT_TIMER_GSI);
+        let lint0_route = lint0_observation.virtual_page_route;
+        let pic_isr = self.get_devices().x86_pic_master_isr();
+        static INJECT_LOG: AtomicUsize = AtomicUsize::new(0);
+        if INJECT_LOG.fetch_add(1, Ordering::Relaxed) % 200 == 0 {
+            info!(
+                "inject_due_x86_pit_irq0: gsi2={gsi2_vector:?} lint0={lint0_route:?} pic_isr={pic_isr:#x}"
+            );
+        }
+
+        let Some(irq) = self.get_devices().x86_ioapic_assert_gsi(X86_PIT_TIMER_GSI) else {
+            let gsi2_vector = self
+                .get_devices()
+                .x86_ioapic_vector_for_gsi(X86_PIT_TIMER_GSI);
+            if self.inject_due_x86_pic_lint0_irq(vcpu)? {
+                return Ok(());
+            }
+            if X86_LEGACY_IRQ_LOG_COUNT.fetch_add(1, Ordering::AcqRel) < X86_LEGACY_IRQ_LOG_LIMIT {
+                info!(
+                    "x86 PIT IRQ0 due but no injectable route: IOAPIC GSI2 \
+                     vector={gsi2_vector:?}, LAPIC LINT0 virtual_page={:#x} route={:?}, \
+                     shadow={:#x} route={:?}, PIC master_isr={:#x}",
+                    lint0_observation.virtual_page_value,
+                    lint0_observation.virtual_page_route,
+                    lint0_observation.shadow_value,
+                    lint0_observation.shadow_route,
+                    self.get_devices().x86_pic_master_isr(),
+                );
+            }
+            return Ok(());
+        };
+
+        if X86_LEGACY_IRQ_LOG_COUNT.fetch_add(1, Ordering::AcqRel) < X86_LEGACY_IRQ_LOG_LIMIT {
+            info!(
+                "x86 PIT IRQ0 due and injected as vector {:#x} ({})",
+                irq.vector,
+                if irq.level_triggered { "level" } else { "edge" }
+            );
+        }
+
+        vcpu.inject_interrupt_with_trigger(
+            irq.vector as _,
+            if irq.level_triggered {
+                axvcpu::InterruptTriggerMode::LevelTriggered
+            } else {
+                axvcpu::InterruptTriggerMode::EdgeTriggered
+            },
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn inject_due_x86_pic_lint0_irq(&self, vcpu: &AxVCpuRef) -> AxResult<bool> {
+        let Some(route) = vcpu.get_arch_vcpu().lint0_route() else {
+            return Ok(false);
+        };
+
+        let (vector, route_name) = match route {
+            LegacyPicLint0Route::Fixed { vector } => {
+                // Fixed mode: read PIC vector with intack (sets ISR)
+                let Some(_pic_vector) = self.get_devices().x86_pic_read_irq_vector() else {
+                    return Ok(false);
+                };
+                (vector, "fixed")
+            }
+            LegacyPicLint0Route::ExtInt => {
+                // ExtINT mode: read PIC vector WITHOUT setting ISR.
+                // On real hardware, the APIC handles the INTA cycle transparently;
+                // the PIC ISR is never set for ExtINT delivery.
+                let isr_before = self.get_devices().x86_pic_master_isr();
+                let Some(pic_vector) = self.get_devices().x86_pic_read_irq_vector_extint() else {
+                    return Ok(false);
+                };
+                info!(
+                    "x86 PIT IRQ0 injected via LINT0 extint: vector={pic_vector:#x} \
+                     isr={:#x}",
+                    self.get_devices().x86_pic_master_isr(),
+                );
+                (pic_vector, "extint")
+            }
+        };
+
+        vcpu.inject_interrupt_with_trigger(
+            vector as _,
+            axvcpu::InterruptTriggerMode::EdgeTriggered,
+        )?;
+        Ok(true)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn inject_pending_x86_serial_irq(&self, vcpu: &AxVCpuRef) -> AxResult {
+        if self.interrupt_mode() != VMInterruptMode::Passthrough {
+            return Ok(());
+        }
+
+        if !self.get_devices().x86_serial_poll_irq() {
+            return Ok(());
+        }
+
+        let Some(irq) = self.get_devices().x86_ioapic_assert_gsi(X86_COM1_GSI) else {
+            return Ok(());
+        };
+
+        vcpu.inject_interrupt_with_trigger(
+            irq.vector as _,
+            if irq.level_triggered {
+                axvcpu::InterruptTriggerMode::LevelTriggered
+            } else {
+                axvcpu::InterruptTriggerMode::EdgeTriggered
+            },
+        )
     }
 
     /// Sets up the VM before booting.
@@ -310,19 +455,6 @@ impl AxVM {
                 #[cfg(target_arch = "x86_64")]
                 (),
             )?));
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            inner_mut.address_space.map_linear(
-                GuestPhysAddr::from(0xfee0_0000),
-                crate::vcpu::EmulatedLocalApic::virtual_apic_access_addr(),
-                0x1000,
-                MappingFlags::DEVICE
-                    | MappingFlags::READ
-                    | MappingFlags::WRITE
-                    | MappingFlags::USER,
-            )?;
         }
 
         let mut pt_dev_region = Vec::new();
@@ -658,6 +790,8 @@ impl AxVM {
 
                 let exit_reason = vcpu.run()?;
                 trace!("{exit_reason:#x?}");
+                #[cfg(target_arch = "x86_64")]
+                let mut poll_emulated_x86_irqs = false;
                 match exit_reason {
                     AxVCpuExitReason::MmioRead {
                         addr,
@@ -674,10 +808,18 @@ impl AxVM {
                             masked & width_mask(reg_width)
                         };
                         vcpu.set_gpr(reg, val);
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            poll_emulated_x86_irqs = true;
+                        }
                     }
                     AxVCpuExitReason::MmioWrite { addr, width, data } => {
                         self.get_devices()
                             .handle_mmio_write(addr, width, data as usize)?;
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            poll_emulated_x86_irqs = true;
+                        }
                     }
                     AxVCpuExitReason::IoRead { port, width } => {
                         let val = {
@@ -703,6 +845,10 @@ impl AxVM {
 
                         #[cfg(target_arch = "riscv64")]
                         vcpu.set_gpr(riscv_vcpu::GprIndex::A0 as usize, val);
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            poll_emulated_x86_irqs = true;
+                        }
                     }
                     AxVCpuExitReason::IoWrite { port, width, data } => {
                         #[cfg(target_arch = "x86_64")]
@@ -737,6 +883,10 @@ impl AxVM {
                             let mem = AxVmGuestMemory { address_space };
                             self.get_devices().x86_fw_cfg_execute_pending_dma(&mem)?;
                         }
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            poll_emulated_x86_irqs = true;
+                        }
                     }
                     AxVCpuExitReason::IoStringRead {
                         port,
@@ -759,16 +909,20 @@ impl AxVM {
 
                         #[cfg(not(target_arch = "x86_64"))]
                         warn!("Unhandled string I/O read from port {:#x}", port.number());
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            poll_emulated_x86_irqs = true;
+                        }
                     }
                     AxVCpuExitReason::IoStringWrite {
                         port,
-                        width: _,
+                        width,
                         src_gpa,
                         count,
                     } => {
                         #[cfg(target_arch = "x86_64")]
                         if port.number() == 0x402 {
-                            let data = self.read_guest_bytes(src_gpa, count)?;
+                            let data = self.read_guest_bytes(src_gpa, count * width.size())?;
                             self.debugcon_write_bytes(&data);
                         } else {
                             warn!("Unhandled string I/O write to port {:#x}", port.number());
@@ -776,6 +930,10 @@ impl AxVM {
 
                         #[cfg(not(target_arch = "x86_64"))]
                         warn!("Unhandled string I/O write to port {:#x}", port.number());
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            poll_emulated_x86_irqs = true;
+                        }
                     }
                     AxVCpuExitReason::SysRegRead { addr, reg } => {
                         let val = self
@@ -796,6 +954,11 @@ impl AxVM {
                         }
                     }
                     exit_reason => break Ok(exit_reason),
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                if poll_emulated_x86_irqs {
+                    self.inject_pending_x86_legacy_irqs(&vcpu)?;
                 }
             }
         })?;
@@ -1125,6 +1288,11 @@ impl AxVM {
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
+    pub fn install_virtio_blk_disk_image(&self, disk: Vec<u8>) {
+        self.ovmf_virtio_blk.lock().install_disk_image(disk);
+    }
+
     /// Allocates a new memory region for the VM.
     pub fn alloc_memory_region(
         &self,
@@ -1205,26 +1373,11 @@ impl AxVM {
         port: Port,
         width: AccessWidth,
     ) -> AxResult<Option<usize>> {
-        if !(OVMF_VIRTIO_BLK_IO_BASE..OVMF_VIRTIO_BLK_IO_BASE + OVMF_VIRTIO_BLK_IO_SIZE)
-            .contains(&port.number())
-        {
+        if !(LEGACY_BLK_IO_BASE..LEGACY_BLK_IO_BASE + LEGACY_BLK_IO_SIZE).contains(&port.number()) {
             return Ok(None);
         }
 
-        let value = unsafe {
-            match width {
-                AccessWidth::Byte => X86Port::<u8>::new(port.number()).read() as usize,
-                AccessWidth::Word => X86Port::<u16>::new(port.number()).read() as usize,
-                AccessWidth::Dword => X86Port::<u32>::new(port.number()).read() as usize,
-                AccessWidth::Qword => {
-                    return ax_err!(InvalidInput, "unsupported qword virtio-blk I/O read");
-                }
-            }
-        };
-
-        if port.number() == OVMF_VIRTIO_BLK_IO_BASE + 0x0c && width == AccessWidth::Word {
-            self.inner_mut.lock().ovmf_virtio_blk.queue_size = value as u16;
-        }
+        let value = self.ovmf_virtio_blk.lock().handle_read(port, width)?;
 
         info!(
             "[OVMF-VIRTIO-BLK-IO] in port={:#x} width={width:?} value={value:#x}",
@@ -1240,178 +1393,37 @@ impl AxVM {
         width: AccessWidth,
         val: usize,
     ) -> AxResult<bool> {
-        if !(OVMF_VIRTIO_BLK_IO_BASE..OVMF_VIRTIO_BLK_IO_BASE + OVMF_VIRTIO_BLK_IO_SIZE)
-            .contains(&port.number())
-        {
+        if !(LEGACY_BLK_IO_BASE..LEGACY_BLK_IO_BASE + LEGACY_BLK_IO_SIZE).contains(&port.number()) {
             return Ok(false);
         }
 
-        let mut forwarded = val;
-        if port.number() == OVMF_VIRTIO_BLK_QUEUE_PFN && width == AccessWidth::Dword {
-            if let Some(translated_pfn) = self.translate_ovmf_virtio_blk_queue_pfn(val as u32) {
-                forwarded = translated_pfn as usize;
-            }
-        }
-
-        if port.number() == OVMF_VIRTIO_BLK_QUEUE_NOTIFY && width == AccessWidth::Word {
-            self.rewrite_ovmf_virtio_blk_descriptors()?;
-            self.dump_ovmf_virtio_blk_queue("before-notify")?;
-        }
-
-        unsafe {
-            match width {
-                AccessWidth::Byte => X86Port::<u8>::new(port.number()).write(forwarded as u8),
-                AccessWidth::Word => X86Port::<u16>::new(port.number()).write(forwarded as u16),
-                AccessWidth::Dword => X86Port::<u32>::new(port.number()).write(forwarded as u32),
-                AccessWidth::Qword => {
-                    return ax_err!(InvalidInput, "unsupported qword virtio-blk I/O write");
-                }
-            }
-        }
+        let address_space = {
+            let g = self.inner_mut.lock();
+            &g.address_space as *const _
+        };
+        let mem = AxVmGuestMemory { address_space };
+        let notify = self
+            .ovmf_virtio_blk
+            .lock()
+            .handle_write(port, width, val, &mem)?;
 
         info!(
-            "[OVMF-VIRTIO-BLK-IO] out port={:#x} width={width:?} value={val:#x} \
-             forwarded={forwarded:#x}",
-            port.number()
+            "[OVMF-VIRTIO-BLK-IO] out port={:#x} width={width:?} value={val:#x} used_any={} \
+             used_count={} should_raise_irq={}",
+            port.number(),
+            notify.used_any,
+            notify.published_used_count,
+            notify.should_raise_irq,
         );
-        Ok(true)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn translate_ovmf_virtio_blk_queue_pfn(&self, queue_pfn: u32) -> Option<u32> {
-        let queue_gpa = GuestPhysAddr::from((queue_pfn as usize) << 12);
-        let mut g = self.inner_mut.lock();
-        let (queue_hpa, limit) = g.address_space.translate_and_get_limit(queue_gpa)?;
-        let translated_pfn = (queue_hpa.as_usize() >> 12) as u32;
-        g.ovmf_virtio_blk.queue_pfn = queue_pfn;
-        g.ovmf_virtio_blk.translated_queue_pfn = translated_pfn;
-        info!(
-            "[OVMF-VIRTIO-BLK] queue_pfn={queue_pfn:#x} queue_gpa={queue_gpa:?} \
-             queue_hpa={queue_hpa:?} limit={limit:#x} translated_pfn={translated_pfn:#x}"
-        );
-        Some(translated_pfn)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn rewrite_ovmf_virtio_blk_descriptors(&self) -> AxResult {
-        let (queue_pfn, queue_size) = {
-            let g = self.inner_mut.lock();
-            (g.ovmf_virtio_blk.queue_pfn, g.ovmf_virtio_blk.queue_size)
-        };
-        if queue_pfn == 0 || queue_size == 0 {
-            return Ok(());
-        }
-
-        let queue_gpa = GuestPhysAddr::from((queue_pfn as usize) << 12);
-        let avail_gpa = GuestPhysAddr::from(queue_gpa.as_usize() + queue_size as usize * 16);
-        let mut avail = [0u8; 6];
-        {
-            let g = self.inner_mut.lock();
-            Self::read_guest_bytes_locked(&g.address_space, avail_gpa, &mut avail)?;
-        }
-        let avail_idx = u16::from_le_bytes(avail[2..4].try_into().unwrap());
-        let ring_slot = avail_idx.wrapping_sub(1) as usize % queue_size as usize;
-        let ring_gpa = GuestPhysAddr::from(avail_gpa.as_usize() + 4 + ring_slot * 2);
-        let mut head_bytes = [0u8; 2];
-        {
-            let g = self.inner_mut.lock();
-            Self::read_guest_bytes_locked(&g.address_space, ring_gpa, &mut head_bytes)?;
-        }
-        let head = u16::from_le_bytes(head_bytes) as usize;
-
-        let mut next = head;
-        for _ in 0..queue_size.min(8) {
-            if next >= queue_size as usize {
-                warn!("[OVMF-VIRTIO-BLK] descriptor index {next} out of queue size {queue_size}");
-                break;
-            }
-
-            let desc_gpa = GuestPhysAddr::from(queue_gpa.as_usize() + next * 16);
-            let mut desc = [0u8; 16];
-            {
-                let g = self.inner_mut.lock();
-                Self::read_guest_bytes_locked(&g.address_space, desc_gpa, &mut desc)?;
-            }
-
-            let addr = u64::from_le_bytes(desc[0..8].try_into().unwrap()) as usize;
-            let len = u32::from_le_bytes(desc[8..12].try_into().unwrap());
-            let flags = u16::from_le_bytes(desc[12..14].try_into().unwrap());
-            let desc_next = u16::from_le_bytes(desc[14..16].try_into().unwrap()) as usize;
-            let translated = {
-                let g = self.inner_mut.lock();
-                g.address_space
-                    .translate_and_get_limit(GuestPhysAddr::from(addr))
-                    .map(|(hpa, limit)| (hpa.as_usize() as u64, limit))
-            };
-
-            if let Some((translated_addr, limit)) = translated {
-                desc[0..8].copy_from_slice(&translated_addr.to_le_bytes());
-                {
-                    let g = self.inner_mut.lock();
-                    Self::write_guest_bytes_locked(&g.address_space, desc_gpa, &desc)?;
-                }
-                info!(
-                    "[OVMF-VIRTIO-BLK] rewrite desc[{next}] addr={addr:#x}->{translated_addr:#x} \
-                     len={len:#x} flags={flags:#x} next={desc_next} limit={limit:#x}"
-                );
-            } else {
-                warn!(
-                    "[OVMF-VIRTIO-BLK] failed to translate desc[{next}] addr={addr:#x} \
-                     len={len:#x} flags={flags:#x} next={desc_next}"
-                );
-            }
-
-            if flags & 0x1 == 0 {
-                break;
-            }
-            next = desc_next;
-        }
-
-        Ok(())
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn dump_ovmf_virtio_blk_queue(&self, tag: &str) -> AxResult {
-        let (queue_pfn, queue_size, translated_queue_pfn) = {
-            let g = self.inner_mut.lock();
-            (
-                g.ovmf_virtio_blk.queue_pfn,
-                g.ovmf_virtio_blk.queue_size,
-                g.ovmf_virtio_blk.translated_queue_pfn,
-            )
-        };
-        if queue_pfn == 0 || queue_size == 0 {
-            info!(
-                "[OVMF-VIRTIO-BLK] {tag}: queue not configured pfn={queue_pfn:#x} \
-                 size={queue_size}"
+        if notify.should_raise_irq {
+            // The current OVMF DXE virtio-blk path completes requests by polling
+            // Used.Idx, so this protocol-level IRQ hint is observational only.
+            trace!(
+                "[OVMF-VIRTIO-BLK-IO] queue completed; current OVMF path polls Used.Idx, so \
+                 AxVisor does not inject INTx here"
             );
-            return Ok(());
         }
-
-        let queue_gpa = GuestPhysAddr::from((queue_pfn as usize) << 12);
-        let avail_gpa = GuestPhysAddr::from(queue_gpa.as_usize() + queue_size as usize * 16);
-        let used_gpa = GuestPhysAddr::from(
-            (avail_gpa.as_usize() + 4 + queue_size as usize * 2 + 0xfff) & !0xfff,
-        );
-        let mut avail = [0u8; 6];
-        let mut used = [0u8; 4];
-        {
-            let g = self.inner_mut.lock();
-            Self::read_guest_bytes_locked(&g.address_space, avail_gpa, &mut avail)?;
-            Self::read_guest_bytes_locked(&g.address_space, used_gpa, &mut used)?;
-        }
-        let avail_flags = u16::from_le_bytes(avail[0..2].try_into().unwrap());
-        let avail_idx = u16::from_le_bytes(avail[2..4].try_into().unwrap());
-        let avail_head = u16::from_le_bytes(avail[4..6].try_into().unwrap());
-        let used_flags = u16::from_le_bytes(used[0..2].try_into().unwrap());
-        let used_idx = u16::from_le_bytes(used[2..4].try_into().unwrap());
-        info!(
-            "[OVMF-VIRTIO-BLK] {tag}: queue_pfn={queue_pfn:#x} \
-             translated_queue_pfn={translated_queue_pfn:#x} size={queue_size} \
-             queue_gpa={queue_gpa:?} avail_idx={avail_idx} avail_head={avail_head} \
-             avail_flags={avail_flags:#x} used_idx={used_idx} used_flags={used_flags:#x}"
-        );
-        Ok(())
+        Ok(true)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1461,46 +1473,6 @@ impl AxVM {
             port.number()
         );
         Ok(true)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn read_guest_bytes_locked(
-        address_space: &AddrSpace<HostPagingHandler>,
-        gpa: GuestPhysAddr,
-        buffer: &mut [u8],
-    ) -> AxResult {
-        match address_space.translated_byte_buffer(gpa, buffer.len()) {
-            Some(mut slices) => {
-                let mut copied = 0;
-                for slice in &mut slices {
-                    let take = (buffer.len() - copied).min(slice.len());
-                    buffer[copied..copied + take].copy_from_slice(&slice[..take]);
-                    copied += take;
-                }
-                Ok(())
-            }
-            None => ax_err!(InvalidInput, "failed to translate guest buffer"),
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn write_guest_bytes_locked(
-        address_space: &AddrSpace<HostPagingHandler>,
-        gpa: GuestPhysAddr,
-        buffer: &[u8],
-    ) -> AxResult {
-        match address_space.translated_byte_buffer(gpa, buffer.len()) {
-            Some(mut slices) => {
-                let mut copied = 0;
-                for slice in &mut slices {
-                    let take = (buffer.len() - copied).min(slice.len());
-                    slice[..take].copy_from_slice(&buffer[copied..copied + take]);
-                    copied += take;
-                }
-                Ok(())
-            }
-            None => ax_err!(InvalidInput, "failed to translate guest buffer"),
-        }
     }
 
     /// Cleanup resources for the VM before drop.

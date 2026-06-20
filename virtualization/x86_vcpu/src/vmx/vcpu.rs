@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::collections::VecDeque;
+use alloc::{collections::VecDeque, format, vec::Vec};
 use core::{
     arch::naked_asm,
-    fmt::{Debug, Formatter, Result},
+    fmt::{Debug, Formatter, Result as FmtResult},
     mem::size_of,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -37,7 +37,7 @@ use x86::{
     segmentation::SegmentSelector,
 };
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags, EferFlags};
-use x86_vlapic::EmulatedLocalApic;
+use x86_vlapic::{EmulatedLocalApic, LegacyPicLint0Route, Lint0Observation};
 
 use super::{
     VmxExitInfo, as_axerr,
@@ -58,6 +58,12 @@ const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 100_000;
 
 const QEMU_EXIT_PORT: u16 = 0x604;
 const QEMU_EXIT_MAGIC: u64 = 0x2000;
+const X86_PIC_MASTER_PORT_BASE: u16 = 0x20;
+const X86_PIC_MASTER_PORT_COUNT: u32 = 2;
+const X86_PIC_SLAVE_PORT_BASE: u16 = 0xa0;
+const X86_PIC_SLAVE_PORT_COUNT: u32 = 2;
+const X86_PIC_ELCR_PORT_BASE: u16 = 0x4d0;
+const X86_PIC_ELCR_PORT_COUNT: u32 = 2;
 const X86_PIT_PORT_BASE: u16 = 0x40;
 const X86_PIT_PORT_COUNT: u32 = 4;
 const X86_PIT_SPEAKER_PORT: u16 = 0x61;
@@ -73,6 +79,15 @@ const X86_IOAPIC_BASE: usize = 0xfec0_0000;
 const X86_IOAPIC_SIZE: usize = 0x1000;
 const OVMF_VIRTIO_BLK_IO_BASE: u16 = 0x6000;
 const OVMF_VIRTIO_BLK_IO_SIZE: u16 = 0x80;
+const X86_PTE_PRESENT_MASK: u64 = 1 << 0;
+const EPT_ENTRY_PRESENT_MASK: u64 = 0x7;
+const X86_PAGE_ENTRY_HUGE_BIT: u64 = 1 << 7;
+const X86_PAGE_ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+const X86_PAGE_4K_MASK: usize = 0xfff;
+const X86_PAGE_2M_MASK: usize = 0x1f_ffff;
+const X86_PAGE_1G_MASK: usize = 0x3fff_ffff;
+const LINUX_X86_64_DIRECT_MAP_BASE_4LEVEL: usize = 0xffff_8880_0000_0000;
+const LINUX_X86_64_DIRECT_MAP_SIZE_4LEVEL: usize = 0x4000_0000_0000;
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum VmCpuMode {
@@ -93,11 +108,82 @@ fn secondary_control_bits_allowed(bits: u32) -> bool {
     ((Msr::IA32_VMX_PROCBASED_CTLS2.read() >> 32) as u32 & bits) == bits
 }
 
+fn configure_default_io_intercepts(io_bitmap: &mut IOBitmap, config: X86VCpuSetupConfig) {
+    io_bitmap.set_intercept_of_range(QEMU_EXIT_PORT as u32, 1, true);
+    io_bitmap.set_intercept_of_range(
+        X86_PIC_MASTER_PORT_BASE as u32,
+        X86_PIC_MASTER_PORT_COUNT,
+        true,
+    );
+    io_bitmap.set_intercept_of_range(
+        X86_PIC_SLAVE_PORT_BASE as u32,
+        X86_PIC_SLAVE_PORT_COUNT,
+        true,
+    );
+    io_bitmap.set_intercept_of_range(X86_PIC_ELCR_PORT_BASE as u32, X86_PIC_ELCR_PORT_COUNT, true);
+    io_bitmap.set_intercept_of_range(X86_PIT_PORT_BASE as u32, X86_PIT_PORT_COUNT, true);
+    io_bitmap.set_intercept(X86_PIT_SPEAKER_PORT as u32, true);
+    if config.emulate_com1 {
+        io_bitmap.set_intercept_of_range(X86_COM1_PORT_BASE as u32, X86_COM1_PORT_COUNT, true);
+    }
+    io_bitmap.set_intercept_of_range(0x402, 1, true);
+    io_bitmap.set_intercept_of_range(0x510, 2, true);
+    io_bitmap.set_intercept_of_range(0x514, 8, true);
+    io_bitmap.set_intercept_of_range(
+        OVMF_VIRTIO_BLK_IO_BASE as u32,
+        OVMF_VIRTIO_BLK_IO_SIZE as u32,
+        true,
+    );
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PendingEvent {
     vector: u8,
     err_code: Option<u32>,
     level_triggered: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum X86PageWalkLevel {
+    Pml4,
+    Pdpt,
+    Pd,
+    Pt,
+}
+
+impl X86PageWalkLevel {
+    fn table_name(self) -> &'static str {
+        match self {
+            Self::Pml4 => "PML4",
+            Self::Pdpt => "PDPT",
+            Self::Pd => "PD",
+            Self::Pt => "PT",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct X86PageWalkStep {
+    level: X86PageWalkLevel,
+    table_addr: usize,
+    entry_addr: usize,
+    index: usize,
+    entry: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct X86PageWalkResult {
+    phys_addr: usize,
+    page_size: usize,
+    steps: Vec<X86PageWalkStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct X86PageWalkError {
+    level: X86PageWalkLevel,
+    entry_addr: usize,
+    entry: u64,
+    steps: Vec<X86PageWalkStep>,
 }
 
 /// A virtual CPU within a guest.
@@ -188,6 +274,14 @@ impl VmxVcpu {
     pub fn setup(&mut self, ept_root: HostPhysAddr, entry: GuestPhysAddr) -> AxResult {
         self.setup_vmcs(entry, ept_root, X86VCpuSetupConfig::default())?;
         Ok(())
+    }
+
+    pub fn lint0_route(&self) -> Option<LegacyPicLint0Route> {
+        self.vlapic.lint0_route()
+    }
+
+    pub fn lint0_observation(&self) -> Lint0Observation {
+        self.vlapic.lint0_observation()
     }
 
     // /// Get the identifier of this [`VmxVcpu`].
@@ -479,34 +573,9 @@ impl VmxVcpu {
 // Implementation of private methods
 impl VmxVcpu {
     fn setup_io_bitmap(&mut self, config: X86VCpuSetupConfig) -> AxResult {
-        // By default, I/O bitmap is set as `intercept_all`.
-        // Todo: these should be combined with emulated pio device management,
-        // in `modules/axvm/src/device/x86_64/mod.rs` somehow.
-        let io_to_be_intercepted = QEMU_EXIT_PORT..QEMU_EXIT_PORT + 1; // QEMU exit port.
-        self.io_bitmap.set_intercept_of_range(
-            io_to_be_intercepted.start as _,
-            io_to_be_intercepted.count() as u32,
-            true,
-        );
-        self.io_bitmap
-            .set_intercept_of_range(X86_PIT_PORT_BASE as u32, X86_PIT_PORT_COUNT, true);
-        self.io_bitmap
-            .set_intercept(X86_PIT_SPEAKER_PORT as u32, true);
-        if config.emulate_com1 {
-            self.io_bitmap.set_intercept_of_range(
-                X86_COM1_PORT_BASE as u32,
-                X86_COM1_PORT_COUNT,
-                true,
-            );
-        }
-        self.io_bitmap.set_intercept_of_range(0x402, 1, true);
-        self.io_bitmap.set_intercept_of_range(0x510, 2, true);
-        self.io_bitmap.set_intercept_of_range(0x514, 8, true);
-        self.io_bitmap.set_intercept_of_range(
-            OVMF_VIRTIO_BLK_IO_BASE as u32,
-            OVMF_VIRTIO_BLK_IO_SIZE as u32,
-            true,
-        );
+        // VmxVcpu starts from `passthrough_all()`, then opts specific legacy
+        // devices into VM-exit based emulation here.
+        configure_default_io_intercepts(&mut self.io_bitmap, config);
         Ok(())
     }
 
@@ -689,6 +758,7 @@ impl VmxVcpu {
             Msr::IA32_VMX_TRUE_PROCBASED_CTLS,
             Msr::IA32_VMX_PROCBASED_CTLS.read() as u32,
             (CpuCtrl::USE_IO_BITMAPS
+                | CpuCtrl::HLT_EXITING
                 | CpuCtrl::USE_MSR_BITMAPS
                 | CpuCtrl::USE_TPR_SHADOW
                 | CpuCtrl::SECONDARY_CONTROLS)
@@ -737,6 +807,20 @@ impl VmxVcpu {
             val.bits(),
             0,
         )?;
+        let primary_exec = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read()?;
+        let secondary_exec = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read()?;
+        info!(
+            "[VMX] exec controls: use_tpr_shadow={} secondary_controls={} ept={}",
+            primary_exec & CpuCtrl::USE_TPR_SHADOW.bits() != 0,
+            primary_exec & CpuCtrl::SECONDARY_CONTROLS.bits() != 0,
+            secondary_exec & CpuCtrl2::ENABLE_EPT.bits() != 0
+        );
+        info!(
+            "[VMX] APICv controls: virt_apic_access={} apic_reg_virt={} virt_intr_delivery={}",
+            secondary_exec & CpuCtrl2::VIRTUALIZE_APIC.bits() != 0,
+            secondary_exec & CpuCtrl2::VIRTUALIZE_APIC_REGISTER.bits() != 0,
+            secondary_exec & CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY.bits() != 0
+        );
 
         // Switch to 64-bit host, acknowledge interrupt info, switch IA32_PAT/IA32_EFER on VM exit.
         use ExitControls as ExitCtrl;
@@ -783,8 +867,10 @@ impl VmxVcpu {
         // VmcsControlNW::CR4_GUEST_HOST_MASK.write(0)?;
         VmcsControl32::CR3_TARGET_COUNT.write(0)?;
 
-        // Intercept common early firmware faults so the first exception is visible before a triple fault.
-        let exception_bitmap: u32 = (1 << 6) | (1 << 8) | (1 << 13) | (1 << 14);
+        // Keep a few fault exits visible during bring-up, but let the guest
+        // handle #PF itself. Linux x86_64 early boot intentionally uses guest
+        // page faults to grow its temporary direct-map page tables.
+        let exception_bitmap: u32 = (1 << 6) | (1 << 8) | (1 << 13);
 
         self.setup_io_bitmap(config)?;
 
@@ -792,9 +878,14 @@ impl VmxVcpu {
         VmcsControl64::IO_BITMAP_A_ADDR.write(self.io_bitmap.phys_addr().0.as_usize() as _)?;
         VmcsControl64::IO_BITMAP_B_ADDR.write(self.io_bitmap.phys_addr().1.as_usize() as _)?;
         VmcsControl64::MSR_BITMAPS_ADDR.write(self.msr_bitmap.phys_addr().as_usize() as _)?;
-        VmcsControl64::VIRT_APIC_ADDR.write(self.vlapic.virtual_apic_page_addr().as_usize() as _)?;
-        VmcsControl64::APIC_ACCESS_ADDR
-            .write(EmulatedLocalApic::virtual_apic_access_addr().as_usize() as _)?;
+        let virt_apic_addr = self.vlapic.virtual_apic_page_addr().as_usize();
+        let apic_access_addr = EmulatedLocalApic::virtual_apic_access_addr().as_usize();
+        VmcsControl64::VIRT_APIC_ADDR.write(virt_apic_addr as _)?;
+        VmcsControl64::APIC_ACCESS_ADDR.write(apic_access_addr as _)?;
+        info!(
+            "[VMX] APIC pages: guest_gpa={:#x} virt_apic_hpa={:#x} apic_access_hpa={:#x}",
+            X86_APIC_ACCESS_GPA, virt_apic_addr, apic_access_addr
+        );
         VmcsControl64::EOI_EXIT0.write(u64::MAX)?;
         VmcsControl64::EOI_EXIT1.write(u64::MAX)?;
         VmcsControl64::EOI_EXIT2.write(u64::MAX)?;
@@ -883,13 +974,103 @@ impl VmxVcpu {
     }
 }
 
-// The current VMX APIC-access decode path is used only with Axvisor's
-// identity-mapped guest RAM layout, so the guest physical address is also
-// the host physical address. A non-identity guest memory backend should
-// replace this helper with an explicit GPA-to-HVA translation.
-fn read_guest_phys_u64(gpa: usize) -> u64 {
-    let hva = host::phys_to_virt(HostPhysAddr::from(gpa));
+fn read_host_phys_u64(hpa: usize) -> u64 {
+    let hva = host::phys_to_virt(HostPhysAddr::from(hpa));
     unsafe { core::ptr::read_unaligned(hva.as_ptr() as *const u64) }
+}
+
+fn walk_4level_page_tables<F>(
+    root_table_addr: usize,
+    addr: usize,
+    present_mask: u64,
+    mut read_entry: F,
+) -> core::result::Result<X86PageWalkResult, X86PageWalkError>
+where
+    F: FnMut(usize) -> u64,
+{
+    let mut table = root_table_addr & X86_PAGE_ENTRY_ADDR_MASK as usize;
+    let mut steps = Vec::with_capacity(4);
+    let indexes = [
+        ((addr >> 39) & 0x1ff, X86PageWalkLevel::Pml4),
+        ((addr >> 30) & 0x1ff, X86PageWalkLevel::Pdpt),
+        ((addr >> 21) & 0x1ff, X86PageWalkLevel::Pd),
+        ((addr >> 12) & 0x1ff, X86PageWalkLevel::Pt),
+    ];
+
+    for (depth, (index, level)) in indexes.into_iter().enumerate() {
+        let entry_addr = table + index * size_of::<u64>();
+        let entry = read_entry(entry_addr);
+        let step = X86PageWalkStep {
+            level,
+            table_addr: table,
+            entry_addr,
+            index,
+            entry,
+        };
+        steps.push(step);
+
+        if entry & present_mask == 0 {
+            return Err(X86PageWalkError {
+                level,
+                entry_addr,
+                entry,
+                steps,
+            });
+        }
+
+        let next_addr = (entry & X86_PAGE_ENTRY_ADDR_MASK) as usize;
+        match depth {
+            1 if entry & X86_PAGE_ENTRY_HUGE_BIT != 0 => {
+                return Ok(X86PageWalkResult {
+                    phys_addr: next_addr + (addr & X86_PAGE_1G_MASK),
+                    page_size: 1 << 30,
+                    steps,
+                });
+            }
+            2 if entry & X86_PAGE_ENTRY_HUGE_BIT != 0 => {
+                return Ok(X86PageWalkResult {
+                    phys_addr: next_addr + (addr & X86_PAGE_2M_MASK),
+                    page_size: 1 << 21,
+                    steps,
+                });
+            }
+            3 => {
+                return Ok(X86PageWalkResult {
+                    phys_addr: next_addr + (addr & X86_PAGE_4K_MASK),
+                    page_size: 1 << 12,
+                    steps,
+                });
+            }
+            _ => table = next_addr,
+        }
+    }
+
+    unreachable!("4-level page walk should resolve at PT or a huge-page level");
+}
+
+fn linux_direct_map_candidate_gpa(gva: usize) -> Option<usize> {
+    if !(LINUX_X86_64_DIRECT_MAP_BASE_4LEVEL
+        ..LINUX_X86_64_DIRECT_MAP_BASE_4LEVEL + LINUX_X86_64_DIRECT_MAP_SIZE_4LEVEL)
+        .contains(&gva)
+    {
+        return None;
+    }
+
+    Some(gva - LINUX_X86_64_DIRECT_MAP_BASE_4LEVEL)
+}
+
+fn select_page_fault_addr(
+    guest_cr2: usize,
+    exit_qualification: usize,
+    guest_linear_addr: usize,
+) -> usize {
+    if exit_qualification != 0 {
+        exit_qualification
+    } else if guest_cr2 != 0 {
+        guest_cr2
+    } else {
+        guest_linear_addr
+    }
 }
 
 /// Get ready then vmlaunch or vmresume.
@@ -1052,11 +1233,11 @@ impl VmxVcpu {
 
         if write {
             let value = self.read_edx_eax();
-            trace!("handle_vlapic_apic_base_write: value={value:#x}");
+            info!("[VMX] IA32_APIC_BASE write: value={value:#x}");
             self.vlapic.set_apic_base(value)
         } else {
             let value = self.vlapic.apic_base();
-            trace!("handle_vlapic_apic_base_read: value={value:#x}");
+            info!("[VMX] IA32_APIC_BASE read: value={value:#x}");
             self.write_edx_eax(value);
             Ok(())
         }
@@ -1072,6 +1253,9 @@ impl VmxVcpu {
             let value = self.read_edx_eax() as usize;
 
             trace!("handle_vlapic_msr_write: msr={msr:#x}, value={value:#x}");
+            if msr == X2APIC_MSR_BASE + 0x35 {
+                info!("[VMX] x2APIC LVT0 write: msr={msr:#x} value={value:#x}");
+            }
 
             if msr == X2APIC_EOI_MSR {
                 Ok(AxVCpuExitReason::InterruptEnd {
@@ -1359,7 +1543,8 @@ impl VmxVcpu {
 
     fn read_guest_u8(&self, gva: GuestVirtAddr) -> AxResult<u8> {
         let gpa = self.translate_guest_linear(gva)?;
-        let hva = host::phys_to_virt(HostPhysAddr::from(gpa.as_usize()));
+        let hpa = self.translate_guest_phys_via_ept(gpa.as_usize())?;
+        let hva = host::phys_to_virt(hpa);
         Ok(unsafe { core::ptr::read_volatile(hva.as_ptr()) })
     }
 
@@ -1376,44 +1561,58 @@ impl VmxVcpu {
     }
 
     fn walk_guest_page_table_4level(&self, gva: usize) -> AxResult<GuestPhysAddr> {
-        const PRESENT: u64 = 1 << 0;
-        const HUGE_PAGE: u64 = 1 << 7;
-        const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
-        const PAGE_4K_MASK: usize = 0xfff;
-        const PAGE_2M_MASK: usize = 0x1f_ffff;
-        const PAGE_1G_MASK: usize = 0x3fff_ffff;
-
-        let mut table = VmcsGuestNW::CR3.read()? & ADDR_MASK as usize;
-        let indexes = [
-            (gva >> 39) & 0x1ff,
-            (gva >> 30) & 0x1ff,
-            (gva >> 21) & 0x1ff,
-            (gva >> 12) & 0x1ff,
-        ];
-
-        for (level, index) in indexes.into_iter().enumerate() {
-            let entry = read_guest_phys_u64(table + index * size_of::<u64>());
-            if entry & PRESENT == 0 {
-                return ax_err!(
+        let walk = self
+            .walk_guest_page_table_4level_debug(gva)
+            .map_err(|err| {
+                ax_err_type!(
                     InvalidInput,
-                    format_args!("guest RIP page table entry is not present at level {level}")
-                );
-            }
+                    format!(
+                        "guest page table entry is not present at {} entry_addr={:#x} entry={:#x}",
+                        err.level.table_name(),
+                        err.entry_addr,
+                        err.entry
+                    )
+                )
+            })?;
+        Ok(GuestPhysAddr::from(walk.phys_addr))
+    }
 
-            let paddr = (entry & ADDR_MASK) as usize;
-            match level {
-                1 if entry & HUGE_PAGE != 0 => {
-                    return Ok(GuestPhysAddr::from(paddr + (gva & PAGE_1G_MASK)));
-                }
-                2 if entry & HUGE_PAGE != 0 => {
-                    return Ok(GuestPhysAddr::from(paddr + (gva & PAGE_2M_MASK)));
-                }
-                3 => return Ok(GuestPhysAddr::from(paddr + (gva & PAGE_4K_MASK))),
-                _ => table = paddr,
-            }
-        }
+    fn walk_guest_page_table_4level_debug(
+        &self,
+        gva: usize,
+    ) -> core::result::Result<X86PageWalkResult, X86PageWalkError> {
+        let root = VmcsGuestNW::CR3.read().unwrap() & X86_PAGE_ENTRY_ADDR_MASK as usize;
+        walk_4level_page_tables(root, gva, X86_PTE_PRESENT_MASK, |entry_gpa| {
+            self.read_guest_phys_u64(entry_gpa).unwrap_or(0)
+        })
+    }
 
-        ax_err!(InvalidInput, "failed to translate guest RIP")
+    fn walk_ept_4level_debug(
+        &self,
+        gpa: usize,
+    ) -> core::result::Result<X86PageWalkResult, X86PageWalkError> {
+        let root = self.ept_root.unwrap().as_usize();
+        walk_4level_page_tables(root, gpa, EPT_ENTRY_PRESENT_MASK, read_host_phys_u64)
+    }
+
+    fn translate_guest_phys_via_ept(&self, gpa: usize) -> AxResult<HostPhysAddr> {
+        let walk = self.walk_ept_4level_debug(gpa).map_err(|err| {
+            ax_err_type!(
+                InvalidInput,
+                format!(
+                    "EPT entry is not present at {} entry_addr={:#x} entry={:#x}",
+                    err.level.table_name(),
+                    err.entry_addr,
+                    err.entry
+                )
+            )
+        })?;
+        Ok(HostPhysAddr::from(walk.phys_addr))
+    }
+
+    fn read_guest_phys_u64(&self, gpa: usize) -> AxResult<u64> {
+        let hpa = self.translate_guest_phys_via_ept(gpa)?;
+        Ok(read_host_phys_u64(hpa.as_usize()))
     }
 
     fn handle_vmx_preemption_timer(&mut self) -> AxResult {
@@ -1712,6 +1911,9 @@ impl VmxVcpu {
         );
         self.dump_guest_descriptor_tables("VMX exception")?;
         self.dump_guest_segments("VMX exception")?;
+        if intr_info.vector == 14 {
+            self.dump_page_fault_analysis();
+        }
         warn!("VCpu {self:#x?}");
 
         Ok(())
@@ -1798,6 +2000,94 @@ impl VmxVcpu {
             VmcsGuest32::TR_ACCESS_RIGHTS.read()?,
         );
         Ok(())
+    }
+
+    fn dump_page_fault_analysis(&self) {
+        let guest_cr2 = self.guest_cr2;
+        let exit_qualification = VmcsReadOnlyNW::EXIT_QUALIFICATION.read().unwrap_or(0);
+        let guest_linear_addr = VmcsReadOnlyNW::GUEST_LINEAR_ADDR.read().unwrap_or(0);
+        let fault_va = select_page_fault_addr(guest_cr2, exit_qualification, guest_linear_addr);
+        let guest_cr3 = VmcsGuestNW::CR3.read().unwrap_or(0);
+        warn!(
+            "VMX page-fault analysis: fault_va={:#x}, guest_cr2={:#x}, qualification={:#x}, \
+             gla={:#x}, guest_cr3={:#x}, paging_level={}",
+            fault_va,
+            guest_cr2,
+            exit_qualification,
+            guest_linear_addr,
+            guest_cr3,
+            self.get_paging_level()
+        );
+        if exit_qualification != 0 && exit_qualification != guest_cr2 {
+            warn!(
+                "VMX page-fault analysis: using exit qualification as the fault VA because guest \
+                 CR2 is stale on this VM-exit path"
+            );
+        }
+
+        if self.get_paging_level() == 4 {
+            match self.walk_guest_page_table_4level_debug(fault_va) {
+                Ok(walk) => {
+                    warn!(
+                        "VMX guest page walk resolved fault_va={:#x} -> gpa={:#x} page_size={:#x}",
+                        fault_va, walk.phys_addr, walk.page_size
+                    );
+                    self.log_page_walk("VMX guest page walk", &walk.steps);
+                }
+                Err(err) => {
+                    warn!(
+                        "VMX guest page walk failed for fault_va={:#x} at {} entry_addr={:#x} \
+                         entry={:#x}",
+                        fault_va,
+                        err.level.table_name(),
+                        err.entry_addr,
+                        err.entry
+                    );
+                    self.log_page_walk("VMX guest page walk", &err.steps);
+                }
+            }
+        }
+
+        if let Some(candidate_gpa) = linux_direct_map_candidate_gpa(fault_va) {
+            warn!(
+                "VMX Linux direct-map candidate: fault_va={:#x} -> candidate_gpa={:#x}",
+                fault_va, candidate_gpa
+            );
+            match self.walk_ept_4level_debug(candidate_gpa) {
+                Ok(walk) => {
+                    warn!(
+                        "VMX EPT walk resolved candidate_gpa={:#x} -> host_phys={:#x} \
+                         page_size={:#x}",
+                        candidate_gpa, walk.phys_addr, walk.page_size
+                    );
+                    self.log_page_walk("VMX EPT walk", &walk.steps);
+                }
+                Err(err) => {
+                    warn!(
+                        "VMX EPT walk failed for candidate_gpa={:#x} at {} entry_addr={:#x} \
+                         entry={:#x}",
+                        candidate_gpa,
+                        err.level.table_name(),
+                        err.entry_addr,
+                        err.entry
+                    );
+                    self.log_page_walk("VMX EPT walk", &err.steps);
+                }
+            }
+        }
+    }
+
+    fn log_page_walk(&self, prefix: &str, steps: &[X86PageWalkStep]) {
+        for step in steps {
+            warn!(
+                "{prefix}: {} table={:#x} index={:#x} entry_addr={:#x} entry={:#x}",
+                step.level.table_name(),
+                step.table_addr,
+                step.index,
+                step.entry_addr,
+                step.entry
+            );
+        }
     }
 
     fn load_guest_xstate(&mut self) {
@@ -1923,8 +2213,8 @@ fn get_tr_base(tr: SegmentSelector, gdt: &DescriptorTablePointer<u64>) -> u64 {
 }
 
 impl Debug for VmxVcpu {
-    fn fmt(&self, f: &mut Formatter) -> Result {
-        (|| -> AxResult<Result> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        (|| -> AxResult<FmtResult> {
             Ok(f.debug_struct("VmxVcpu")
                 .field("guest_regs", &self.guest_regs)
                 .field("rip", &VmcsGuestNW::RIP.read()?)
@@ -2100,7 +2390,7 @@ impl AxArchVCpu for VmxVcpu {
                     }
                     VmxExitReason::HLT => {
                         self.advance_rip(exit_info.exit_instruction_length as _)?;
-                        AxVCpuExitReason::PreemptionTimer
+                        AxVCpuExitReason::Halt
                     }
                     VmxExitReason::VIRTUALIZED_EOI => AxVCpuExitReason::InterruptEnd {
                         vector: self.vlapic.handle_eoi(),
@@ -2231,7 +2521,7 @@ impl AxArchVCpu for VmxVcpu {
 
 #[cfg(test)]
 mod tests {
-    use alloc::format;
+    use alloc::{collections::BTreeMap, format};
 
     use super::*;
 
@@ -2292,9 +2582,108 @@ mod tests {
         assert_eq!(value.get_bits(32..64), 0xabcdef00);
     }
 
+    #[test]
+    fn walk_4level_page_tables_resolves_4k_mapping() {
+        let root = 0x1000usize;
+        let pdpt = 0x2000usize;
+        let pd = 0x3000usize;
+        let pt = 0x4000usize;
+        let target_page = 0x1234_5000usize;
+        let gva = 0x0000_0123_4567_89abusize;
+
+        let mut entries = BTreeMap::new();
+        entries.insert(root + (((gva >> 39) & 0x1ff) * 8), (pdpt as u64) | 0x1);
+        entries.insert(pdpt + (((gva >> 30) & 0x1ff) * 8), (pd as u64) | 0x1);
+        entries.insert(pd + (((gva >> 21) & 0x1ff) * 8), (pt as u64) | 0x1);
+        entries.insert(pt + (((gva >> 12) & 0x1ff) * 8), (target_page as u64) | 0x1);
+
+        let walk = walk_4level_page_tables(root, gva, X86_PTE_PRESENT_MASK, |entry_addr| {
+            *entries.get(&entry_addr).unwrap_or(&0)
+        })
+        .unwrap();
+
+        assert_eq!(walk.phys_addr, target_page + (gva & X86_PAGE_4K_MASK));
+        assert_eq!(walk.page_size, 1 << 12);
+        assert_eq!(walk.steps.len(), 4);
+        assert_eq!(walk.steps[0].level, X86PageWalkLevel::Pml4);
+        assert_eq!(walk.steps[3].level, X86PageWalkLevel::Pt);
+    }
+
+    #[test]
+    fn walk_4level_page_tables_resolves_2m_huge_mapping() {
+        let root = 0x1000usize;
+        let pdpt = 0x2000usize;
+        let pd = 0x3000usize;
+        let huge_page = 0x4560_0000usize;
+        let gva = 0x0000_0000_2456_789ausize;
+
+        let mut entries = BTreeMap::new();
+        entries.insert(root + (((gva >> 39) & 0x1ff) * 8), (pdpt as u64) | 0x1);
+        entries.insert(pdpt + (((gva >> 30) & 0x1ff) * 8), (pd as u64) | 0x1);
+        entries.insert(
+            pd + (((gva >> 21) & 0x1ff) * 8),
+            (huge_page as u64) | X86_PTE_PRESENT_MASK | X86_PAGE_ENTRY_HUGE_BIT,
+        );
+
+        let walk = walk_4level_page_tables(root, gva, X86_PTE_PRESENT_MASK, |entry_addr| {
+            *entries.get(&entry_addr).unwrap_or(&0)
+        })
+        .unwrap();
+
+        assert_eq!(walk.phys_addr, huge_page + (gva & X86_PAGE_2M_MASK));
+        assert_eq!(walk.page_size, 1 << 21);
+        assert_eq!(walk.steps.len(), 3);
+        assert_eq!(walk.steps[2].level, X86PageWalkLevel::Pd);
+    }
+
+    #[test]
+    fn walk_4level_page_tables_reports_missing_entry_level() {
+        let root = 0x1000usize;
+        let pdpt = 0x2000usize;
+        let gva = 0x0000_0000_2456_789ausize;
+
+        let mut entries = BTreeMap::new();
+        entries.insert(root + (((gva >> 39) & 0x1ff) * 8), (pdpt as u64) | 0x1);
+
+        let err = walk_4level_page_tables(root, gva, X86_PTE_PRESENT_MASK, |entry_addr| {
+            *entries.get(&entry_addr).unwrap_or(&0)
+        })
+        .unwrap_err();
+
+        assert_eq!(err.level, X86PageWalkLevel::Pdpt);
+        assert_eq!(err.steps.len(), 2);
+        assert_eq!(err.entry, 0);
+    }
+
+    #[test]
+    fn linux_direct_map_candidate_matches_fault_example() {
+        let fault_va = 0xffff_8880_0e27_6000usize;
+        assert_eq!(linux_direct_map_candidate_gpa(fault_va), Some(0x0e27_6000));
+        assert_eq!(linux_direct_map_candidate_gpa(0xffff_8000_0000_0000), None);
+    }
+
+    #[test]
+    fn select_page_fault_addr_prefers_exit_qualification() {
+        assert_eq!(
+            select_page_fault_addr(0, 0xffff_8880_0e27_6000, 0x1234),
+            0xffff_8880_0e27_6000
+        );
+    }
+
+    #[test]
+    fn select_page_fault_addr_falls_back_to_guest_cr2() {
+        assert_eq!(select_page_fault_addr(0x2000, 0, 0x1000), 0x2000);
+    }
+
+    #[test]
+    fn select_page_fault_addr_last_uses_guest_linear_addr() {
+        assert_eq!(select_page_fault_addr(0, 0, 0x3000), 0x3000);
+    }
+
     // Mock tests for VmxVcpu (limited to safe operations)
     mod vmx_vcpu_tests {
         use super::*;
+        use crate::test_utils::mock::MockMmHal;
 
         // Helper function to create a test VmxVcpu (this would normally require VMX hardware)
         fn create_test_vcpu_regs() -> GeneralRegisters {
@@ -2412,6 +2801,21 @@ mod tests {
             assert_eq!(LEAF_HYPERVISOR_INFO, 0x40000000);
             assert_eq!(FEATURE_VMX, 32);
             assert_eq!(FEATURE_HYPERVISOR, 0x80000000);
+        }
+
+        #[test]
+        fn setup_io_bitmap_intercepts_legacy_pic_ports() {
+            MockMmHal::run_test(|| {
+                let mut io_bitmap = IOBitmap::passthrough_all().unwrap();
+                configure_default_io_intercepts(&mut io_bitmap, X86VCpuSetupConfig::default());
+
+                for port in [0x20_u32, 0x21, 0xa0, 0xa1, 0x4d0, 0x4d1] {
+                    assert!(
+                        io_bitmap.is_intercepted(port),
+                        "legacy PIC port {port:#x} must be intercepted"
+                    );
+                }
+            });
         }
 
         #[test]

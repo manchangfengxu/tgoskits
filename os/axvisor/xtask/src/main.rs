@@ -80,7 +80,7 @@ fn normalize_command_paths(
     invocation_dir: &Path,
     workspace_root: &Path,
 ) {
-    use axbuild::axvisor::{Command, TestCommand, image};
+    use axbuild::axvisor::{Command, TestCommand};
 
     match command {
         Command::Build(args) => normalize_build_paths(args, invocation_dir, workspace_root),
@@ -96,12 +96,6 @@ fn normalize_command_paths(
         Command::Uboot(args) => {
             normalize_build_paths(&mut args.build, invocation_dir, workspace_root);
             normalize_existing_path(&mut args.uboot_config, invocation_dir, workspace_root);
-        }
-        Command::Image(args) => {
-            normalize_output_path(&mut args.overrides.local_storage, invocation_dir);
-            if let image::Command::Pull(args) = &mut args.command {
-                normalize_output_path(&mut args.output_dir, invocation_dir);
-            }
         }
         Command::Test(args) => match &mut args.command {
             TestCommand::Uboot(args) => {

@@ -14,9 +14,12 @@
 
 #[cfg(test)]
 pub mod mock {
+    use core::time::Duration;
     use std::sync::Mutex;
 
     use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr};
+    use axvm_types::{InterruptVector, VCpuId, VMId};
+    use x86_vlapic::host::X86VlapicHostIf;
 
     use crate::host::X86VcpuHostIf;
 
@@ -43,6 +46,7 @@ pub mod mock {
 
     #[derive(Debug)]
     pub struct MockMmHal;
+    pub struct MockVlapicHal;
 
     #[ax_crate_interface::impl_interface]
     impl X86VcpuHostIf for MockMmHal {
@@ -144,6 +148,84 @@ pub mod mock {
 
         fn current_vm_vcpu_num() -> usize {
             1
+        }
+    }
+
+    #[ax_crate_interface::impl_interface]
+    impl X86VlapicHostIf for MockVlapicHal {
+        fn alloc_frame() -> Option<PhysAddr> {
+            <MockMmHal as X86VcpuHostIf>::alloc_frame()
+        }
+
+        fn dealloc_frame(paddr: PhysAddr) {
+            <MockMmHal as X86VcpuHostIf>::dealloc_frame(paddr)
+        }
+
+        fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
+            <MockMmHal as X86VcpuHostIf>::phys_to_virt(paddr)
+        }
+
+        fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
+            let state = GLOBAL_LOCK.lock().unwrap();
+            let addr = vaddr.as_usize();
+
+            for (page_index, page) in state.memory_pool.iter().enumerate() {
+                let start = page.as_ptr() as usize;
+                let end = start + PAGE_SIZE_4K;
+                if (start..end).contains(&addr) {
+                    let offset = addr - start;
+                    return PhysAddr::from(0x1000 + page_index * PAGE_SIZE_4K + offset);
+                }
+            }
+
+            PhysAddr::from(addr)
+        }
+
+        fn current_time() -> Duration {
+            Duration::ZERO
+        }
+
+        fn current_time_nanos() -> u64 {
+            0
+        }
+
+        fn register_timer(
+            _deadline: Duration,
+            _callback: alloc::boxed::Box<dyn FnOnce(Duration) + Send + 'static>,
+        ) -> usize {
+            0
+        }
+
+        fn cancel_timer(_token: usize) {}
+
+        fn write_bytes(_bytes: &[u8]) {}
+
+        fn read_bytes(_bytes: &mut [u8]) -> usize {
+            0
+        }
+
+        fn current_vm_id() -> VMId {
+            0
+        }
+
+        fn current_vm_vcpu_num() -> usize {
+            1
+        }
+
+        fn current_vm_active_vcpus() -> usize {
+            1
+        }
+
+        fn active_vcpus(vm_id: VMId) -> Option<usize> {
+            (vm_id == 0).then_some(1)
+        }
+
+        fn inject_interrupt(
+            _vm_id: VMId,
+            _vcpu_id: VCpuId,
+            _vector: InterruptVector,
+        ) -> ax_errno::AxResult {
+            Ok(())
         }
     }
 
