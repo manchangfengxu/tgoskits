@@ -14,8 +14,10 @@ const IOAPIC_VECTOR_BASE: usize = 0x20;
 const IOAPIC_GSI_COUNT: usize = 24;
 const IOAPIC_VECTOR_END: usize = IOAPIC_VECTOR_BASE + IOAPIC_GSI_COUNT;
 
-const PIT_TIMER_GSI: usize = 0;
-const COM1_GSI: usize = 4;
+// On PC-compatible x86 machines, ISA IRQ0 is routed to IOAPIC input 2 rather
+// than input 0. QEMU follows the same rule in hw/intc/ioapic.c, and the guest
+// ACPI MADT we forward advertises INT_SRC_OVR(bus_irq=0, global_irq=2).
+const PIT_TIMER_GSI: usize = 2;
 static IOAPIC_IRQ_FORWARDING_ENABLED: AtomicBool = AtomicBool::new(false);
 static IOAPIC_IRQ_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
 static IOAPIC_IRQ_FORWARD_VM_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -35,55 +37,21 @@ pub fn forward_passthrough_irq_from_vmexit(vm: &VMRef, vcpu: &VCpuRef, vector: u
 }
 
 pub fn inject_due_pit_irq0(vm: &VMRef, vcpu: &VCpuRef) {
-    if vm.interrupt_mode() != VMInterruptMode::Passthrough {
-        return;
+    if let Err(err) = vm.inject_due_x86_pit_irq0(vcpu) {
+        warn!(
+            "failed to inject due x86 PIT IRQ0 into VM[{}]: {err:?}",
+            vm.id()
+        );
     }
-
-    let now_ns = crate::host::arceos::monotonic_time_nanos();
-    if !vm.get_devices().x86_pit_consume_irq0_if_due(now_ns) {
-        return;
-    }
-
-    let Some(irq) = vm.get_devices().x86_ioapic_assert_gsi(PIT_TIMER_GSI) else {
-        trace!("x86 PIT IRQ0 due but vIOAPIC GSI0 is not ready");
-        return;
-    };
-
-    vcpu.inject_interrupt_with_trigger(
-        irq.vector as _,
-        if irq.level_triggered {
-            InterruptTriggerMode::LevelTriggered
-        } else {
-            InterruptTriggerMode::EdgeTriggered
-        },
-    )
-    .unwrap();
 }
 
 pub fn inject_pending_serial_irq(vm: &VMRef, vcpu: &VCpuRef) {
-    if vm.interrupt_mode() != VMInterruptMode::Passthrough {
-        return;
+    if let Err(err) = vm.inject_pending_x86_serial_irq(vcpu) {
+        warn!(
+            "failed to inject pending x86 COM1 IRQ into VM[{}]: {err:?}",
+            vm.id()
+        );
     }
-
-    if !vm.get_devices().x86_serial_poll_irq() {
-        return;
-    }
-
-    let Some(irq) = vm.get_devices().x86_ioapic_assert_gsi(COM1_GSI) else {
-        trace!("x86 COM1 RX pending but vIOAPIC GSI4 is not ready");
-        return;
-    };
-
-    trace!("Injecting x86 COM1 RX IRQ vector {:#x}", irq.vector);
-    vcpu.inject_interrupt_with_trigger(
-        irq.vector as _,
-        if irq.level_triggered {
-            InterruptTriggerMode::LevelTriggered
-        } else {
-            InterruptTriggerMode::EdgeTriggered
-        },
-    )
-    .unwrap();
 }
 
 pub fn inject_pending_ioapic_irq_after_eoi(vm: &VMRef, vcpu: &VCpuRef, vector: u8) {

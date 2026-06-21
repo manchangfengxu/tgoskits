@@ -30,7 +30,10 @@ use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType, GuestPhysAddr, GuestP
 #[cfg(target_arch = "riscv64")]
 use riscv_vplic::VPlicGlobal;
 #[cfg(target_arch = "x86_64")]
-use x86_vlapic::{EmulatedIoApic, EmulatedPit, EmulatedSerialPort, IoApicInterrupt};
+use x86_vlapic::{
+    EmulatedIoApic, EmulatedPic8259, EmulatedPicElcrPort, EmulatedPicMasterPort,
+    EmulatedPicSlavePort, EmulatedPit, EmulatedSerialPort, IoApicInterrupt,
+};
 
 use crate::{AxVmDeviceConfig, fw_cfg::FwCfgDevice, range_alloc::RangeAllocator};
 
@@ -140,6 +143,8 @@ pub struct AxVmDevices {
     #[cfg(target_arch = "x86_64")]
     x86_ioapic: Option<Arc<EmulatedIoApic>>,
     #[cfg(target_arch = "x86_64")]
+    x86_pic: Option<Arc<EmulatedPic8259>>,
+    #[cfg(target_arch = "x86_64")]
     x86_pit: Option<Arc<EmulatedPit>>,
     #[cfg(target_arch = "x86_64")]
     x86_serial: Option<Arc<EmulatedSerialPort>>,
@@ -186,6 +191,8 @@ impl AxVmDevices {
             #[cfg(target_arch = "x86_64")]
             x86_ioapic: None,
             #[cfg(target_arch = "x86_64")]
+            x86_pic: None,
+            #[cfg(target_arch = "x86_64")]
             x86_pit: None,
             #[cfg(target_arch = "x86_64")]
             x86_serial: None,
@@ -197,10 +204,17 @@ impl AxVmDevices {
         Self::init(&mut this, &config.emu_configs);
         #[cfg(target_arch = "x86_64")]
         {
+            let pic = Arc::new(EmulatedPic8259::new());
+            this.x86_pic = Some(Arc::clone(&pic));
+            this.add_port_dev(Arc::new(EmulatedPicMasterPort::new(Arc::clone(&pic))));
+            this.add_port_dev(Arc::new(EmulatedPicSlavePort::new(Arc::clone(&pic))));
+            this.add_port_dev(Arc::new(EmulatedPicElcrPort::new(Arc::clone(&pic))));
+
             let fw_cfg = Arc::new(FwCfgDevice::new());
             this.x86_fw_cfg = Some(Arc::clone(&fw_cfg));
             this.add_port_dev(fw_cfg);
             this.add_port_dev(Arc::new(OvmfDebugConDevice::new()));
+            info!("x86 8259 PIC initialized for ports 0x20/0x21, 0xa0/0xa1, 0x4d0/0x4d1");
         }
         this
     }
@@ -524,9 +538,10 @@ impl AxVmDevices {
     /// Assert an x86 IOAPIC GSI and return the interrupt to inject.
     #[cfg(target_arch = "x86_64")]
     pub fn x86_ioapic_assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt> {
-        self.x86_ioapic
-            .as_ref()
-            .and_then(|ioapic| ioapic.assert_gsi(gsi))
+        let pic = self.x86_pic.as_ref().cloned();
+        self.x86_ioapic.as_ref().and_then(|ioapic| {
+            ioapic.assert_gsi(gsi, || pic.as_ref().and_then(|pic| pic.read_irq_vector()))
+        })
     }
 
     /// Broadcast an x86 local APIC EOI to the virtual IOAPIC.
@@ -543,6 +558,34 @@ impl AxVmDevices {
         self.x86_pit
             .as_ref()
             .is_some_and(|pit| pit.consume_irq0_if_due(now_ns))
+    }
+
+    /// Assert or deassert a legacy x86 PIC IRQ line.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_pic_assert_irq(&self, irq: usize, level: bool) {
+        if let Some(pic) = &self.x86_pic {
+            pic.assert_irq(irq, level);
+        }
+    }
+
+    /// Read and acknowledge the current PIC vector, if one is pending.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_pic_read_irq_vector(&self) -> Option<u8> {
+        self.x86_pic.as_ref().and_then(|pic| pic.read_irq_vector())
+    }
+
+    /// Read PIC vector for ExtINT delivery without setting PIC ISR.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_pic_read_irq_vector_extint(&self) -> Option<u8> {
+        self.x86_pic
+            .as_ref()
+            .and_then(|pic| pic.read_irq_vector_extint())
+    }
+
+    /// Diagnostic: return the master PIC ISR value.
+    #[cfg(target_arch = "x86_64")]
+    pub fn x86_pic_master_isr(&self) -> u8 {
+        self.x86_pic.as_ref().map_or(0, |pic| pic.master_isr())
     }
 
     /// Poll x86 COM1 and return whether it has a pending RX interrupt.

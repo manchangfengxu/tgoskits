@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use ax_errno::{AxResult, ax_err};
 use ax_kspin::SpinNoIrq as Mutex;
 use ax_memory_addr::AddrRange;
@@ -23,6 +25,9 @@ const REDIRECTION_ENTRY_MASKED: u64 = 1 << 16;
 const REDIRECTION_ENTRY_TRIGGER_MODE: u64 = 1 << 15;
 const REDIRECTION_ENTRY_REMOTE_IRR: u64 = 1 << 14;
 const REDIRECTION_ENTRY_DELIVERY_MODE_MASK: u64 = 0b111 << 8;
+const REDIRECTION_ENTRY_DELIVERY_MODE_FIXED: u64 = 0;
+const REDIRECTION_ENTRY_DELIVERY_MODE_EXTINT: u64 = 0b111 << 8;
+static TIMER_ROUTE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 struct IoApicState {
@@ -40,18 +45,43 @@ impl IoApicState {
         }
     }
 
-    fn interrupt_for_entry(&mut self, gsi: usize) -> Option<IoApicInterrupt> {
+    fn interrupt_for_entry<F>(
+        &mut self,
+        gsi: usize,
+        read_extint_vector: &mut F,
+    ) -> Option<IoApicInterrupt>
+    where
+        F: FnMut() -> Option<u8>,
+    {
         let entry = self.redirection_table.get_mut(gsi)?;
         if *entry & REDIRECTION_ENTRY_MASKED != 0 {
+            if gsi == 2 && TIMER_ROUTE_LOG_COUNT.fetch_add(1, Ordering::AcqRel) < 16 {
+                info!("vIOAPIC GSI2 is still masked while the guest waits for IRQ0");
+            }
             return None;
         }
 
-        if *entry & REDIRECTION_ENTRY_DELIVERY_MODE_MASK != 0 {
-            debug!("vIOAPIC GSI {gsi} uses unsupported delivery mode entry {entry:#x}");
-            return None;
-        }
-
-        let vector = (*entry & 0xff) as u8;
+        let vector = match *entry & REDIRECTION_ENTRY_DELIVERY_MODE_MASK {
+            REDIRECTION_ENTRY_DELIVERY_MODE_FIXED => (*entry & 0xff) as u8,
+            REDIRECTION_ENTRY_DELIVERY_MODE_EXTINT => {
+                let vector = read_extint_vector()?;
+                if gsi == 2 && TIMER_ROUTE_LOG_COUNT.fetch_add(1, Ordering::AcqRel) < 16 {
+                    info!("vIOAPIC GSI2 is using ExtINT delivery with PIC vector {vector:#x}");
+                }
+                vector
+            }
+            _ => {
+                if gsi == 2 && TIMER_ROUTE_LOG_COUNT.fetch_add(1, Ordering::AcqRel) < 16 {
+                    info!(
+                        "vIOAPIC GSI2 uses unsupported delivery mode entry {entry:#x} while \
+                         waiting for IRQ0"
+                    );
+                } else {
+                    debug!("vIOAPIC GSI {gsi} uses unsupported delivery mode entry {entry:#x}");
+                }
+                return None;
+            }
+        };
         if vector < 16 {
             return None;
         }
@@ -125,9 +155,12 @@ impl EmulatedIoApic {
     }
 
     /// Assert an IO APIC input line and return the interrupt to inject.
-    pub fn assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt> {
+    pub fn assert_gsi<F>(&self, gsi: usize, mut read_extint_vector: F) -> Option<IoApicInterrupt>
+    where
+        F: FnMut() -> Option<u8>,
+    {
         let mut state = self.state.lock();
-        state.interrupt_for_entry(gsi)
+        state.interrupt_for_entry(gsi, &mut read_extint_vector)
     }
 
     /// Process an EOI broadcast from the local APIC.
@@ -144,7 +177,7 @@ impl EmulatedIoApic {
 
             *entry &= !REDIRECTION_ENTRY_REMOTE_IRR;
             if core::mem::take(&mut state.pending_level[gsi]) {
-                return state.interrupt_for_entry(gsi);
+                return state.interrupt_for_entry(gsi, &mut || None);
             }
         }
 

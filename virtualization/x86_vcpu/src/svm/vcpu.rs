@@ -18,7 +18,7 @@ use bit_field::BitField;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use x86::controlregs::Xcr0;
 use x86_64::registers::control::{Cr0Flags, Cr4Flags, EferFlags};
-use x86_vlapic::EmulatedLocalApic;
+use x86_vlapic::{EmulatedLocalApic, LegacyPicLint0Route, Lint0Observation};
 
 use super::{
     definitions::{SvmExitCode, SvmIntercept},
@@ -27,7 +27,7 @@ use super::{
     vmcb::{InterceptCrRw, InterceptExceptions, NestedCtl, VmcbTlbControl, set_vmcb_segment},
 };
 use crate::{
-    X86VCpuSetupConfig, msr::Msr, regs::GeneralRegisters, restore_host_interrupt_flag,
+    X86VCpuSetupConfig, host, msr::Msr, regs::GeneralRegisters, restore_host_interrupt_flag,
     x86_real_mode_entry_state, xstate::XState,
 };
 
@@ -38,6 +38,13 @@ const X86_PIT_PORT_COUNT: u32 = 4;
 const X86_PIT_SPEAKER_PORT: u16 = 0x61;
 const X86_COM1_PORT_BASE: u16 = 0x3f8;
 const X86_COM1_PORT_COUNT: u32 = 8;
+const OVMF_DEBUGCON_PORT: u16 = 0x402;
+const FW_CFG_IO_BASE: u16 = 0x510;
+const FW_CFG_IO_COUNT: u32 = 2;
+const FW_CFG_DMA_IO_BASE: u16 = 0x514;
+const FW_CFG_DMA_IO_COUNT: u32 = 8;
+const OVMF_VIRTIO_BLK_IO_BASE: u16 = 0x6000;
+const OVMF_VIRTIO_BLK_IO_SIZE: u32 = 0x80;
 const X86_IOAPIC_BASE: usize = 0xfec0_0000;
 const X86_IOAPIC_SIZE: usize = 0x1000;
 const X86_LOCAL_APIC_BASE: usize = 0xfee0_0000;
@@ -249,6 +256,14 @@ impl SvmVcpu {
         self.setup_vmcb_control(npt_root)
     }
 
+    pub fn lint0_route(&self) -> Option<LegacyPicLint0Route> {
+        self.vlapic.lint0_route()
+    }
+
+    pub fn lint0_observation(&self) -> Lint0Observation {
+        self.vlapic.lint0_observation()
+    }
+
     fn setup_vmcb_guest(&mut self, entry: GuestPhysAddr) -> AxResult {
         let entry_state = x86_real_mode_entry_state(entry);
         let cr0_val =
@@ -386,6 +401,16 @@ impl SvmVcpu {
             self.iopm
                 .set_intercept_of_range(X86_COM1_PORT_BASE as u32, X86_COM1_PORT_COUNT, true);
         }
+        self.iopm.set_intercept(OVMF_DEBUGCON_PORT as u32, true);
+        self.iopm
+            .set_intercept_of_range(FW_CFG_IO_BASE as u32, FW_CFG_IO_COUNT, true);
+        self.iopm
+            .set_intercept_of_range(FW_CFG_DMA_IO_BASE as u32, FW_CFG_DMA_IO_COUNT, true);
+        self.iopm.set_intercept_of_range(
+            OVMF_VIRTIO_BLK_IO_BASE as u32,
+            OVMF_VIRTIO_BLK_IO_SIZE,
+            true,
+        );
         Ok(())
     }
 
@@ -779,8 +804,7 @@ impl SvmVcpu {
                 let host_ebx = res.ebx;
                 let host_edx = res.edx;
                 let apic_id = (self.vcpu_id as u32) & 0xff;
-                let logical_processor_count =
-                    (host::current_vm_vcpu_num() as u32).clamp(1, 0xff);
+                let logical_processor_count = (host::current_vm_vcpu_num() as u32).clamp(1, 0xff);
                 // Do not expose nested hardware virtualization to the guest.
                 res.ecx &= !FEATURE_VMX;
                 res.ecx &= !FEATURE_PCID;
@@ -1500,8 +1524,40 @@ impl AxArchVCpu for SvmVcpu {
                     // IOIO exits provide the decoded next RIP in EXITINFO2.
                     self.set_rip(exit_info.exit_info_2);
 
-                    if is_string || is_repeat {
-                        warn!("SVM unsupported IOIO exit: {exit_info:#x?}");
+                    if is_string {
+                        let count = if is_repeat {
+                            self.regs().rcx as usize
+                        } else {
+                            1
+                        };
+                        let access_bytes = width.size() as u64 * count as u64;
+                        if is_in {
+                            let dst_gpa = GuestPhysAddr::from_usize(self.regs().rdi as usize);
+                            self.regs_mut().rdi = self.regs().rdi.wrapping_add(access_bytes);
+                            if is_repeat {
+                                self.regs_mut().rcx = 0;
+                            }
+                            AxVCpuExitReason::IoStringRead {
+                                port,
+                                width,
+                                dst_gpa,
+                                count,
+                            }
+                        } else {
+                            let src_gpa = GuestPhysAddr::from_usize(self.regs().rsi as usize);
+                            self.regs_mut().rsi = self.regs().rsi.wrapping_add(access_bytes);
+                            if is_repeat {
+                                self.regs_mut().rcx = 0;
+                            }
+                            AxVCpuExitReason::IoStringWrite {
+                                port,
+                                width,
+                                src_gpa,
+                                count,
+                            }
+                        }
+                    } else if is_repeat {
+                        warn!("SVM unsupported repeated scalar IOIO exit: {exit_info:#x?}");
                         warn!("VCpu {self:#x?}");
                         AxVCpuExitReason::Halt
                     } else if is_in {

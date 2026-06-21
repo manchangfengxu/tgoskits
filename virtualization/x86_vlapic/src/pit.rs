@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use ax_errno::{AxResult, ax_err};
 use ax_kspin::SpinNoIrq as Mutex;
 use axdevice_base::{AccessWidth, BaseDeviceOps, EmuDeviceType, Port, PortRange};
@@ -13,6 +15,7 @@ const PIT_PORT_END: u16 = PIT_SPEAKER_CONTROL;
 const PIT_BASE_FREQUENCY_HZ: u64 = 1_193_182;
 const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
 const MIN_PERIOD_NS: u64 = 1_000;
+static PIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AccessMode {
@@ -244,9 +247,14 @@ struct PitState {
 }
 
 impl PitState {
-    const fn new() -> Self {
+    fn new(now_ns: u64) -> Self {
+        let mut channel0 = PitChannel::new();
+        channel0.mode = PitMode::SquareWaveGenerator;
+        // PC-compatible reset starts PIT channel 0 in mode 3 with a 0x10000 divisor.
+        channel0.program_reload(0, now_ns);
+
         Self {
-            channel0: PitChannel::new(),
+            channel0,
             channel2: PitChannel::new(),
             speaker_control: 0,
         }
@@ -260,9 +268,9 @@ pub struct EmulatedPit {
 
 impl EmulatedPit {
     /// Create a new PIT device.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            state: Mutex::new(PitState::new()),
+            state: Mutex::new(PitState::new(host::current_time_nanos())),
         }
     }
 
@@ -320,6 +328,12 @@ impl EmulatedPit {
         if access_mode == AccessMode::LatchCount {
             pit_channel.latch_count(now_ns);
             return;
+        }
+
+        if channel == 0 && PIT_LOG_COUNT.fetch_add(1, Ordering::AcqRel) < 16 {
+            info!(
+                "x86 PIT channel0 command: mode={mode:?} access={access_mode:?} raw={command:#x}"
+            );
         }
 
         pit_channel.access_mode = access_mode;
@@ -398,7 +412,21 @@ impl BaseDeviceOps<PortRange> for EmulatedPit {
         let now_ns = host::current_time_nanos();
         let mut state = self.state.lock();
         match port.0 {
-            PIT_CHANNEL0 => state.channel0.write_count(val as u8, now_ns),
+            PIT_CHANNEL0 => {
+                let was_null_count = state.channel0.null_count;
+                state.channel0.write_count(val as u8, now_ns);
+                if was_null_count
+                    && !state.channel0.null_count
+                    && PIT_LOG_COUNT.fetch_add(1, Ordering::AcqRel) < 16
+                {
+                    info!(
+                        "x86 PIT channel0 armed: mode={:?} reload={} period_ns={}",
+                        state.channel0.mode,
+                        state.channel0.divisor(),
+                        state.channel0.period_ns.unwrap_or_default()
+                    );
+                }
+            }
             PIT_CHANNEL2 => state.channel2.write_count(val as u8, now_ns),
             PIT_COMMAND => {
                 Self::write_command(&mut state, val as u8, now_ns);
@@ -407,5 +435,32 @@ impl BaseDeviceOps<PortRange> for EmulatedPit {
             _ => return ax_err!(Unsupported, "unsupported x86 PIT write port"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NANOSECONDS_PER_SECOND, PIT_BASE_FREQUENCY_HZ, PitState};
+
+    const PIT_RESET_DIVISOR: u64 = 0x1_0000;
+
+    #[test]
+    fn channel0_is_live_after_reset() {
+        let pit_period_ns = (PIT_RESET_DIVISOR * NANOSECONDS_PER_SECOND) / PIT_BASE_FREQUENCY_HZ;
+        let state = PitState::new(0);
+
+        assert!(
+            !state.channel0.null_count,
+            "channel 0 should already have a loaded reset count"
+        );
+        assert_eq!(
+            state.channel0.period_ns,
+            Some(pit_period_ns),
+            "channel 0 should start ticking at the PC reset divisor"
+        );
+        assert_eq!(
+            state.channel0.next_deadline_ns,
+            state.channel0.start_ns.saturating_add(pit_period_ns)
+        );
     }
 }

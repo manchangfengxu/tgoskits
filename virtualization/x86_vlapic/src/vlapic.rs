@@ -51,6 +51,47 @@ const APIC_BASE_X2APIC_ENABLE: u64 = 1 << 10;
 const APIC_BASE_BSP: u64 = 1 << 8;
 const APIC_VERSION_INTEGRATED: u32 = 0x14;
 const APIC_VERSION_MAX_LVT_ENTRIES: u32 = 6 << 16;
+const LVT_DELIVERY_MODE_FIXED: u32 = 0b000 << 8;
+const LVT_DELIVERY_MODE_EXTINT: u32 = 0b111 << 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyPicLint0Route {
+    Fixed { vector: u8 },
+    ExtInt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Lint0Observation {
+    pub virtual_page_value: u32,
+    pub shadow_value: u32,
+    pub virtual_page_route: Option<LegacyPicLint0Route>,
+    pub shadow_route: Option<LegacyPicLint0Route>,
+}
+
+fn lint0_route_from_lvt(value: u32) -> Option<LegacyPicLint0Route> {
+    if value & APIC_LVT_M != 0 {
+        return None;
+    }
+
+    let delivery_mode = value & LVT_LINT0::DeliveryMode::SET.mask();
+    if delivery_mode == LVT_DELIVERY_MODE_FIXED {
+        let vector = (value & APIC_LVT_VECTOR) as u8;
+        return (vector >= 16).then_some(LegacyPicLint0Route::Fixed { vector });
+    }
+    if delivery_mode == LVT_DELIVERY_MODE_EXTINT {
+        return Some(LegacyPicLint0Route::ExtInt);
+    }
+    None
+}
+
+fn lint0_observation_from_values(virtual_page_value: u32, shadow_value: u32) -> Lint0Observation {
+    Lint0Observation {
+        virtual_page_value,
+        shadow_value,
+        virtual_page_route: lint0_route_from_lvt(virtual_page_value),
+        shadow_route: lint0_route_from_lvt(shadow_value),
+    }
+}
 
 /// Virtual-APIC Registers.
 pub struct VirtualApicRegs {
@@ -168,6 +209,14 @@ impl VirtualApicRegs {
             .LVT_TIMER
             .read_as_enum(LVT_TIMER::TimerMode)
             .ok_or_else(|| ax_err_type!(InvalidData, "Failed to read timer mode from LVT_TIMER"))
+    }
+
+    pub fn lint0_route(&self) -> Option<LegacyPicLint0Route> {
+        self.lint0_observation().virtual_page_route
+    }
+
+    pub fn lint0_observation(&self) -> Lint0Observation {
+        lint0_observation_from_values(self.regs().LVT_LINT0.get(), self.lvt_last.lvt_lint0.get())
     }
 
     /// 30.1.4 EOI Virtualization
@@ -640,10 +689,13 @@ impl VirtualApicRegs {
                 mask |= LVT_LINT0::DeliveryMode::SET.mask();
                 val &= mask;
 
+                info!(
+                    "[VLAPIC] LINT0 write: raw={val:#x} route={:?}",
+                    lint0_route_from_lvt(val)
+                );
+
                 // vlapic mask/unmask LINT0 for ExtINT?
-                if (val & LVT_LINT0::DeliveryMode::SET.mask())
-                    == LVT_LINT0::DeliveryMode::ExtINT.mask()
-                {
+                if (val & LVT_LINT0::DeliveryMode::SET.mask()) == LVT_DELIVERY_MODE_EXTINT {
                     let last = self.lvt_last.lvt_lint0;
                     if last.is_set(LVT_LINT0::Mask) && val & LVT_LINT0::Mask::SET.mask() == 0 {
                         // mask -> unmask: may from every vlapic in the vm
@@ -733,6 +785,49 @@ impl VirtualApicRegs {
     fn write_dcr(&mut self) -> AxResult {
         self.virtual_timer.write_dcr(self.regs().DCR_TIMER.get());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        APIC_LVT_M, LVT_DELIVERY_MODE_EXTINT, LVT_DELIVERY_MODE_FIXED, LegacyPicLint0Route,
+        lint0_observation_from_values, lint0_route_from_lvt,
+    };
+
+    #[test]
+    fn lint0_route_ignores_masked_entries() {
+        assert_eq!(lint0_route_from_lvt(APIC_LVT_M | 0x31), None);
+    }
+
+    #[test]
+    fn lint0_route_reports_fixed_vector() {
+        assert_eq!(
+            lint0_route_from_lvt(LVT_DELIVERY_MODE_FIXED | 0x31),
+            Some(LegacyPicLint0Route::Fixed { vector: 0x31 })
+        );
+    }
+
+    #[test]
+    fn lint0_route_reports_extint_mode() {
+        assert_eq!(
+            lint0_route_from_lvt(LVT_DELIVERY_MODE_EXTINT),
+            Some(LegacyPicLint0Route::ExtInt)
+        );
+    }
+
+    #[test]
+    fn lint0_observation_surfaces_virtual_page_shadow_split() {
+        let raw_lint0 = LVT_DELIVERY_MODE_FIXED | 0x30;
+        let observation = lint0_observation_from_values(raw_lint0, APIC_LVT_M);
+
+        assert_eq!(observation.virtual_page_value, raw_lint0);
+        assert_eq!(
+            observation.virtual_page_route,
+            Some(LegacyPicLint0Route::Fixed { vector: 0x30 })
+        );
+        assert_eq!(observation.shadow_value, APIC_LVT_M);
+        assert_eq!(observation.shadow_route, None);
     }
 }
 

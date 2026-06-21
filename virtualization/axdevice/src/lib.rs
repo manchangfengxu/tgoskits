@@ -31,6 +31,8 @@ mod device;
 #[cfg(target_arch = "x86_64")]
 pub mod fw_cfg;
 mod range_alloc;
+#[cfg(target_arch = "x86_64")]
+pub mod virtio_blk;
 
 pub use axdevice_base::{
     AccessWidth, BaseDeviceOps, BaseMmioDeviceOps, BasePortDeviceOps, BaseSysRegDeviceOps, Port,

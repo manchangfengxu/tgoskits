@@ -371,6 +371,43 @@ impl ImageLoader {
     }
 
     #[cfg(target_arch = "x86_64")]
+    fn log_x86_64_uefi_ovmf_fs_contract(&self) {
+        let disk_path = self.config.kernel.disk_path.as_deref();
+        info!(
+            "x86_64 UEFI+OVMF fs path preloads OVMF_CODE/OVMF_VARS{}; EFI payload loading is left to OVMF",
+            if disk_path.is_some() {
+                " and disk_path"
+            } else {
+                ""
+            }
+        );
+
+        if !self.config.kernel.kernel_path.is_empty() {
+            info!(
+                "x86_64 UEFI+OVMF fs path keeps kernel_path={} as config metadata; it is not preloaded into guest RAM on this path",
+                self.config.kernel.kernel_path
+            );
+        }
+
+        if let Some(ramdisk_path) = self.config.kernel.ramdisk_path.as_deref() {
+            warn!(
+                "x86_64 UEFI+OVMF fs path does not preload ramdisk_path={}; put the initrd on disk_path and let OVMF/EFI stub open it",
+                ramdisk_path
+            );
+        }
+
+        match disk_path {
+            Some(path) => info!(
+                "x86_64 UEFI+OVMF fs path will expose disk_path={} as the nested virtio-blk disk for OVMF",
+                path
+            ),
+            None => warn!(
+                "x86_64 UEFI+OVMF fs path has no disk_path; OVMF has no nested disk to load an EFI payload from"
+            ),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
     fn should_load_default_x86_boot_image(&self) -> bool {
         self.config.kernel.enable_bios
             && self.config.kernel.boot_firmware_path().is_none()
@@ -619,6 +656,18 @@ impl ImageLoader {
         );
         fs::load_vm_image(ramdisk_path, load_gpa, self.vm.clone())
     }
+
+    #[cfg(all(feature = "fs", target_arch = "x86_64"))]
+    fn load_virtio_blk_disk_from_filesystem(&self, disk_path: &str) -> AxResult {
+        let disk = fs::read_image_file(disk_path)?;
+        info!(
+            "Loading virtio-blk disk image from {} ({} bytes)",
+            disk_path,
+            disk.len()
+        );
+        self.vm.install_virtio_blk_disk_image(disk);
+        Ok(())
+    }
 }
 
 pub fn load_vm_image_from_memory(
@@ -711,7 +760,11 @@ pub mod fs {
             if loader.config.kernel.effective_boot_protocol() == VMBootProtocol::Uefi
                 && loader.config.kernel.ovmf_code_path.is_some()
             {
+                loader.log_x86_64_uefi_ovmf_fs_contract();
                 loader.load_uefi_ovmf_images()?;
+                if let Some(disk_path) = &loader.config.kernel.disk_path {
+                    loader.load_virtio_blk_disk_from_filesystem(disk_path)?;
+                }
                 return Ok(());
             }
         }
@@ -762,6 +815,10 @@ pub mod fs {
         if let Some(ramdisk_path) = &loader.config.kernel.ramdisk_path {
             loader.load_ramdisk_from_filesystem(ramdisk_path)?;
         };
+        #[cfg(target_arch = "x86_64")]
+        if let Some(disk_path) = &loader.config.kernel.disk_path {
+            loader.load_virtio_blk_disk_from_filesystem(disk_path)?;
+        }
         // Load DTB image if needed.
         let vm_config = crate::config::build_axvm_config(&loader.config);
         if let Some(dtb_arc) = get_vm_dtb_arc(&vm_config) {
@@ -855,7 +912,7 @@ pub mod fs {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn read_image_file(image_path: &str) -> AxResult<Vec<u8>> {
+    pub(crate) fn read_image_file(image_path: &str) -> AxResult<Vec<u8>> {
         crate::manager::AxvmManager::read_file(image_path)
     }
 

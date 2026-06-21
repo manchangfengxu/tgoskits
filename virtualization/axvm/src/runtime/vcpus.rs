@@ -26,6 +26,8 @@ use crate::{
 };
 
 const KERNEL_STACK_SIZE: usize = 0x40000; // 256 KiB
+#[cfg(target_arch = "x86_64")]
+static X86_POLL_EXIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// A global map that holds the vCPU task state for each VM.
 static VM_VCPU_TASKS: Mutex<BTreeMap<usize, Arc<VMVCpus>>> = Mutex::new(BTreeMap::new());
@@ -513,6 +515,13 @@ fn vcpu_run() {
                 }
                 AxVCpuExitReason::ExternalInterrupt { vector } => {
                     debug!("VM[{vm_id}] run VCpu[{vcpu_id}] get irq {vector}");
+                    #[cfg(target_arch = "x86_64")]
+                    if X86_POLL_EXIT_LOG_COUNT.fetch_add(1, Ordering::AcqRel) < 16 {
+                        info!(
+                            "VM[{vm_id}] VCpu[{vcpu_id}] left guest on ExternalInterrupt vector \
+                             {vector:#x}"
+                        );
+                    }
 
                     // TODO: maybe move this irq dispatcher to lower layer to accelerate the interrupt handling
                     #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
@@ -530,9 +539,15 @@ fn vcpu_run() {
                         vector as usize,
                     );
                     #[cfg(target_arch = "x86_64")]
+                    super::x86_irq::inject_due_pit_irq0(&vm, &vcpu);
+                    #[cfg(target_arch = "x86_64")]
                     super::x86_irq::inject_pending_serial_irq(&vm, &vcpu);
                 }
                 AxVCpuExitReason::PreemptionTimer => {
+                    #[cfg(target_arch = "x86_64")]
+                    if X86_POLL_EXIT_LOG_COUNT.fetch_add(1, Ordering::AcqRel) < 16 {
+                        info!("VM[{vm_id}] VCpu[{vcpu_id}] left guest on VMX preemption timer");
+                    }
                     crate::timer::check_events();
                     #[cfg(target_arch = "x86_64")]
                     super::x86_irq::inject_due_pit_irq0(&vm, &vcpu);

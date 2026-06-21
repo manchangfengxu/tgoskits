@@ -23,6 +23,7 @@ extern crate log;
 
 mod consts;
 pub mod host;
+mod pic;
 mod pit;
 mod regs;
 mod serial;
@@ -53,9 +54,11 @@ pub struct EmulatedLocalApic {
     vlapic_regs: UnsafeCell<VirtualApicRegs>,
 }
 
+pub use pic::{EmulatedPic8259, EmulatedPicElcrPort, EmulatedPicMasterPort, EmulatedPicSlavePort};
 pub use pit::EmulatedPit;
 pub use serial::EmulatedSerialPort;
 pub use vioapic::{EmulatedIoApic, IoApicInterrupt};
+pub use vlapic::{LegacyPicLint0Route, Lint0Observation};
 
 impl EmulatedLocalApic {
     /// Create a new `EmulatedLocalApic`.
@@ -139,6 +142,17 @@ impl EmulatedLocalApic {
     /// Process a guest EOI and return the vector that needs an IO APIC EOI broadcast.
     pub fn handle_eoi(&self) -> Option<u8> {
         self.get_mut_vlapic_regs().handle_eoi()
+    }
+
+    /// Return the currently active legacy PIC route on LAPIC LINT0, if any.
+    pub fn lint0_route(&self) -> Option<LegacyPicLint0Route> {
+        self.get_vlapic_regs().lint0_route()
+    }
+
+    /// Return the raw and decoded LINT0 state from both the virtual-APIC page
+    /// and the software shadow copy.
+    pub fn lint0_observation(&self) -> Lint0Observation {
+        self.get_vlapic_regs().lint0_observation()
     }
 }
 
