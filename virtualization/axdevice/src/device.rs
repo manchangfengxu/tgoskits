@@ -35,7 +35,9 @@ use x86_vlapic::{
     EmulatedPicSlavePort, EmulatedPit, EmulatedSerialPort, IoApicInterrupt,
 };
 
-use crate::{AxVmDeviceConfig, fw_cfg::FwCfgDevice, range_alloc::RangeAllocator};
+#[cfg(target_arch = "x86_64")]
+use crate::fw_cfg::FwCfgDevice;
+use crate::{AxVmDeviceConfig, range_alloc::RangeAllocator};
 
 const OVMF_DEBUGCON_PORT: u16 = 0x402;
 

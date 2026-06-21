@@ -284,7 +284,10 @@ impl AxVM {
         }
 
         static PIT_TICK_LOG: AtomicUsize = AtomicUsize::new(0);
-        if PIT_TICK_LOG.fetch_add(1, Ordering::Relaxed) % 200 == 0 {
+        if PIT_TICK_LOG
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(200)
+        {
             info!("inject_due_x86_pit_irq0: tick due at {now_ns}ns");
         }
 
@@ -300,9 +303,13 @@ impl AxVM {
         let lint0_route = lint0_observation.virtual_page_route;
         let pic_isr = self.get_devices().x86_pic_master_isr();
         static INJECT_LOG: AtomicUsize = AtomicUsize::new(0);
-        if INJECT_LOG.fetch_add(1, Ordering::Relaxed) % 200 == 0 {
+        if INJECT_LOG
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(200)
+        {
             info!(
-                "inject_due_x86_pit_irq0: gsi2={gsi2_vector:?} lint0={lint0_route:?} pic_isr={pic_isr:#x}"
+                "inject_due_x86_pit_irq0: gsi2={gsi2_vector:?} lint0={lint0_route:?} \
+                 pic_isr={pic_isr:#x}"
             );
         }
 
@@ -352,28 +359,26 @@ impl AxVM {
             return Ok(false);
         };
 
-        let (vector, route_name) = match route {
+        let vector = match route {
             LegacyPicLint0Route::Fixed { vector } => {
                 // Fixed mode: read PIC vector with intack (sets ISR)
                 let Some(_pic_vector) = self.get_devices().x86_pic_read_irq_vector() else {
                     return Ok(false);
                 };
-                (vector, "fixed")
+                vector
             }
             LegacyPicLint0Route::ExtInt => {
                 // ExtINT mode: read PIC vector WITHOUT setting ISR.
                 // On real hardware, the APIC handles the INTA cycle transparently;
                 // the PIC ISR is never set for ExtINT delivery.
-                let isr_before = self.get_devices().x86_pic_master_isr();
                 let Some(pic_vector) = self.get_devices().x86_pic_read_irq_vector_extint() else {
                     return Ok(false);
                 };
                 info!(
-                    "x86 PIT IRQ0 injected via LINT0 extint: vector={pic_vector:#x} \
-                     isr={:#x}",
+                    "x86 PIT IRQ0 injected via LINT0 extint: vector={pic_vector:#x} isr={:#x}",
                     self.get_devices().x86_pic_master_isr(),
                 );
-                (pic_vector, "extint")
+                pic_vector
             }
         };
 

@@ -11,6 +11,7 @@ use ax_errno::{AxResult, ax_err};
 use axvcpu::{
     AxArchPerCpu, AxArchVCpu, AxVCpuExitReason, GuestPhysAddr, HostPhysAddr, VCpuId, VMId,
 };
+use x86_vlapic::{LegacyPicLint0Route, Lint0Observation};
 
 use crate::X86VCpuSetupConfig;
 
@@ -80,5 +81,20 @@ impl AxArchVCpu for X86ArchVCpu {
 
     fn set_return_value(&mut self, _val: usize) {
         unreachable!("no hypervisor backend (vmx/svm) enabled")
+    }
+}
+
+impl X86ArchVCpu {
+    pub fn lint0_route(&self) -> Option<LegacyPicLint0Route> {
+        None
+    }
+
+    pub fn lint0_observation(&self) -> Lint0Observation {
+        Lint0Observation {
+            virtual_page_value: 0,
+            shadow_value: 0,
+            virtual_page_route: None,
+            shadow_route: None,
+        }
     }
 }

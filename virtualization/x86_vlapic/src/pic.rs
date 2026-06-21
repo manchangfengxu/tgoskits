@@ -15,8 +15,6 @@ const PIC_SLAVE_ELCR_PORT: u16 = 0x4d1;
 const MASTER_ELCR_MASK: u8 = 0xf8;
 const SLAVE_ELCR_MASK: u8 = 0xde;
 static PIC_INIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static PIC_MASK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static PIC_VECTOR_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PIC_EOI_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug)]
@@ -333,7 +331,6 @@ impl PicState {
 
     fn read_irq_vector(&mut self) -> Option<u8> {
         let master_irq = self.master.get_irq();
-        let slave_irq = self.slave.get_irq();
         info!(
             "[VPIC] read_irq_vector: master_irq={master_irq:?} master_irr={:#x} master_imr={:#x} \
              master_isr={:#x} master_last_irr={:#x}",

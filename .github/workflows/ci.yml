@@ -606,12 +606,22 @@ jobs:
             runs_on: '["ubuntu-latest"]'
             command: |
               cpu_vendor="$(awk -F ': *' '/^vendor_id/ { print $2; exit }' /proc/cpuinfo)"
+              cpu_flags="$(awk -F ': *' '/^flags/ { print $2; exit }' /proc/cpuinfo)"
+              skip_reason=""
               if [ "$cpu_vendor" = "GenuineIntel" ]; then
-                echo "::notice::Skipping axvisor x86_64 SVM hosted test on Intel CPU; SVM requires an AMD CPU."
+                skip_reason="Runner CPU vendor is \`GenuineIntel\`; AMD SVM tests require an AMD CPU."
+              elif ! printf '%s\n' "$cpu_flags" | grep -qw svm; then
+                skip_reason="Runner CPU flags do not advertise \`svm\`; AMD SVM tests require SVM support."
+              elif [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+                skip_reason="\`/dev/kvm\` is not available or accessible on this runner."
+              fi
+
+              if [ -n "$skip_reason" ]; then
+                echo "::notice::Skipping axvisor x86_64 SVM hosted test: $skip_reason"
                 {
                   echo "## Axvisor SVM hosted test skipped"
                   echo ""
-                  echo "Runner CPU vendor is \`GenuineIntel\`; AMD SVM tests require an AMD CPU."
+                  echo "$skip_reason"
                 } >> "$GITHUB_STEP_SUMMARY"
                 exit 0
               fi
